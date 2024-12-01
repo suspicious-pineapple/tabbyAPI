@@ -7,6 +7,7 @@ Also serves as a common module for completions and chat completions.
 import asyncio
 import pathlib
 from asyncio import CancelledError
+import re
 from fastapi import HTTPException, Request
 from typing import List, Union
 
@@ -20,6 +21,7 @@ from common.networking import (
     handle_request_error,
     request_disconnect_loop,
 )
+from common.multimodal import MultimodalEmbeddingWrapper
 from common.tabby_config import config
 from common.utils import unwrap
 from endpoints.OAI.types.completion import (
@@ -246,18 +248,25 @@ async def generate_completion(
     """Non-streaming generate for completions"""
 
     gen_tasks: List[asyncio.Task] = []
-
+    
     try:
         logger.info(f"Recieved completion request {request.state.id}")
 
         for _ in range(0, data.n):
             task_gen_params = data.model_copy(deep=True)
-
+            mm_embeddings = MultimodalEmbeddingWrapper() if model.container.use_vision else None
+            tags = re.findall(r'<img src="([^"]+)"', data.prompt)
+            for tag in tags:
+                logger.info(f"Adding multimodal embedding for tag {tag}")   
+                await mm_embeddings.add(tag)
+                data.prompt = data.prompt.replace(f'<img src="{tag}">', mm_embeddings.text_alias[-1])
+                
             gen_tasks.append(
                 asyncio.create_task(
                     model.container.generate(
                         data.prompt,
                         request.state.id,
+                        embeddings=mm_embeddings,
                         **task_gen_params.model_dump(exclude={"prompt"}),
                     )
                 )
