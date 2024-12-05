@@ -16,14 +16,14 @@ class MultimodalEmbeddingWrapper:
     content: List = []
     text_alias: List[str] = []
 
-    async def add(self, url: str):
+    async def add(self, url: str, scaling: int = 1):
         # Determine the type of vision embedding to use
         if not self.type:
             if isinstance(model.container.vision_model, ExLlamaV2VisionTower):
                 self.type = "ExLlamaV2MMEmbedding"
 
         if self.type == "ExLlamaV2MMEmbedding":
-            embedding = await get_image_embedding(url)
+            embedding = await get_image_embedding(url, scaling)
             self.content.append(embedding)
             self.text_alias.append(embedding.text_alias)
         else:

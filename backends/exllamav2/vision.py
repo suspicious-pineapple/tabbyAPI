@@ -63,8 +63,14 @@ async def get_image(url: str) -> Image:
 
 # Fetch the return type on runtime
 @alru_cache(20)
-async def get_image_embedding(url: str) -> "ExLlamaV2MMEmbedding":
+async def get_image_embedding(url: str, scaling: int = 1) -> "ExLlamaV2MMEmbedding":
     image = await get_image(url)
+
+    new_width = int(image.width * scaling)
+    new_height = int(image.height * scaling)
+
+    image = image.resize((new_width, new_height))
+
     return model.container.vision_model.get_image_embeddings(
         model=model.container.model,
         tokenizer=model.container.tokenizer,
