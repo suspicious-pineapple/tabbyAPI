@@ -236,6 +236,20 @@ if __name__ == "__main__":
         subprocess.run(install_command)
         print()
 
+        if first_run:
+            start_options["first_run_done"] = True
+
+            # Save start options on first run
+            with open("start_options.json", "w") as start_file:
+                start_file.write(json.dumps(start_options))
+
+                print(
+                    "Successfully wrote your start script options to "
+                    "`start_options.json`. \n"
+                    "If something goes wrong, editing or deleting the file "
+                    "will reinstall TabbyAPI as a first-time user."
+                )
+
         if args.update_deps:
             print(
                 f"Dependencies updated. Please run TabbyAPI with `start.{script_ext}`. "
@@ -248,21 +262,6 @@ if __name__ == "__main__":
                 "inside the `update_scripts` folder."
             )
 
-    # First run options
-    if first_run:
-        start_options["first_run_done"] = True
-
-        # Save start options
-        with open("start_options.json", "w") as start_file:
-            start_file.write(json.dumps(start_options))
-
-            print(
-                "Successfully wrote your start script options to "
-                "`start_options.json`. \n"
-                "If something goes wrong, editing or deleting the file "
-                "will reinstall TabbyAPI as a first-time user."
-            )
-
     # Expand the parser if it's not fully created
     if not has_full_parser:
         from common.args import init_argparser
@@ -272,10 +271,7 @@ if __name__ == "__main__":
 
     # Assume all dependencies are installed from here
     try:
-        from common.args import convert_args_to_dict
         from main import entrypoint
-
-        converted_args = convert_args_to_dict(args, parser)
 
         # Create a config if it doesn't exist
         # This is not necessary to run TabbyAPI, but is new user proof
@@ -292,7 +288,7 @@ if __name__ == "__main__":
             )
 
         print("Starting TabbyAPI...")
-        entrypoint(converted_args)
+        entrypoint(args, parser)
     except (ModuleNotFoundError, ImportError):
         traceback.print_exc()
         print(

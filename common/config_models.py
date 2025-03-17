@@ -351,6 +351,13 @@ class DraftModelConfig(BaseConfigModel):
             f"Possible values: {str(CACHE_SIZES)[15:-1]}."
         ),
     )
+    draft_gpu_split: List[float] = Field(
+        default_factory=list,
+        description=(
+            "An integer array of GBs of VRAM to split between GPUs (default: []).\n"
+            "If this isn't filled in, the draft model is autosplit."
+        ),
+    )
 
 
 class LoraInstanceModel(BaseConfigModel):
@@ -436,14 +443,6 @@ class DeveloperConfig(BaseConfigModel):
     )
     cuda_malloc_backend: Optional[bool] = Field(
         False, description=("Enable the torch CUDA malloc backend (default: False).")
-    )
-    uvloop: Optional[bool] = Field(
-        False,
-        description=(
-            "Run asyncio using Uvloop or Winloop which can improve performance.\n"
-            "NOTE: It's recommended to enable this, but if something breaks "
-            "turn this off."
-        ),
     )
     realtime_process_priority: Optional[bool] = Field(
         False,

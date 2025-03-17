@@ -1,5 +1,6 @@
 """The main tabbyAPI module. Contains the FastAPI server and endpoints."""
 
+import argparse
 import asyncio
 import os
 import pathlib
@@ -11,7 +12,7 @@ from typing import Optional
 from common import gen_logging, sampling, model
 from common.args import convert_args_to_dict, init_argparser
 from common.auth import load_auth_keys
-from common.actions import branch_to_actions
+from common.actions import run_subcommand
 from common.logger import setup_logger
 from common.networking import is_port_in_use
 from common.signals import signal_handler
@@ -99,23 +100,36 @@ async def entrypoint_async():
     await start_api(host, port)
 
 
-def entrypoint(arguments: Optional[dict] = None):
+def entrypoint(
+    args: Optional[argparse.Namespace] = None,
+    parser: Optional[argparse.ArgumentParser] = None,
+):
     setup_logger()
 
     # Set up signal aborting
     signal.signal(signal.SIGINT, signal_handler)
     signal.signal(signal.SIGTERM, signal_handler)
 
+    if platform.system() == "Windows":
+        from winloop import install
+    else:
+        from uvloop import install
+
+    # Set loop event policy
+    install()
+
     # Parse and override config from args
-    if arguments is None:
+    if args is None:
         parser = init_argparser()
-        arguments = convert_args_to_dict(parser.parse_args(), parser)
+        args = parser.parse_args()
+
+    dict_args = convert_args_to_dict(args, parser)
 
     # load config
-    config.load(arguments)
+    config.load(dict_args)
 
     # branch to default paths if required
-    if branch_to_actions():
+    if run_subcommand(args):
         return
 
     # Check exllamav2 version and give a descriptive error if it's too old
@@ -132,18 +146,6 @@ def entrypoint(arguments: Optional[dict] = None):
     if config.developer.cuda_malloc_backend:
         os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "backend:cudaMallocAsync"
         logger.warning("EXPERIMENTAL: Enabled the pytorch CUDA malloc backend.")
-
-    # Use Uvloop/Winloop
-    if config.developer.uvloop:
-        if platform.system() == "Windows":
-            from winloop import install
-        else:
-            from uvloop import install
-
-        # Set loop event policy
-        install()
-
-        logger.warning("EXPERIMENTAL: Running program with Uvloop/Winloop.")
 
     # Set the process priority
     if config.developer.realtime_process_priority:

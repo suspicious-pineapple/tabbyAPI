@@ -37,8 +37,14 @@ async def _download_file(
     req_headers = {"Authorization": f"Bearer {token}"} if token else {}
 
     async with session.get(url, headers=req_headers) as response:
-        # TODO: Change to raise errors
-        assert response.status == 200
+        if not response.ok:
+            error_text = await response.text()
+            raise aiohttp.ClientResponseError(
+                response.request_info,
+                response.history,
+                status=response.status,
+                message=f"HTTP {response.status}: {error_text}",
+            )
 
         file_size = int(response.headers["Content-Length"])
 
@@ -98,10 +104,10 @@ async def hf_repo_download(
     folder_name: Optional[str],
     revision: Optional[str],
     token: Optional[str],
-    chunk_limit: Optional[float],
     include: Optional[List[str]],
     exclude: Optional[List[str]],
-    timeout: Optional[int],
+    chunk_limit: Optional[float] = None,
+    timeout: Optional[int] = None,
     repo_type: Optional[str] = "model",
 ):
     """Gets a repo's information from HuggingFace and downloads it locally."""

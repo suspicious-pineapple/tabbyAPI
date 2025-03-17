@@ -89,7 +89,8 @@ class ExllamaV2Container:
     generation_config: Optional[GenerationConfig] = None
 
     # GPU split vars
-    gpu_split: Optional[list] = None
+    gpu_split: List[float] = []
+    draft_gpu_split: List[float] = []
     gpu_split_auto: bool = True
     autosplit_reserve: List[float] = [96 * 1024**2]
     use_tp: bool = False
@@ -180,6 +181,7 @@ class ExllamaV2Container:
             )
             draft_model_path = draft_model_path / draft_model_name
 
+            self.draft_gpu_split = unwrap(draft_args.get("draft_gpu_split"), [])
             self.draft_model_dir = draft_model_path
             self.draft_config.model_dir = str(draft_model_path.resolve())
             self.draft_config.prepare()
@@ -193,7 +195,7 @@ class ExllamaV2Container:
         gpu_count = torch.cuda.device_count()
         gpu_split_auto = unwrap(kwargs.get("gpu_split_auto"), True)
         use_tp = unwrap(kwargs.get("tensor_parallel"), False)
-        gpu_split = kwargs.get("gpu_split")
+        gpu_split = unwrap(kwargs.get("gpu_split"), [])
         gpu_device_list = list(range(0, gpu_count))
 
         # Set GPU split options
@@ -230,6 +232,15 @@ class ExllamaV2Container:
                 self.autosplit_reserve = [
                     int(math.ceil(value * 1024**2))
                     for value in autosplit_reserve_megabytes
+                ]
+
+            # Change the GPU device list only if gpu_split's list is too small
+            # This allows for an uneven list specification
+            if self.draft_gpu_split and len(self.draft_gpu_split) > len(self.gpu_split):
+                gpu_device_list = [
+                    device_idx
+                    for device_idx, memory in enumerate(self.draft_gpu_split)
+                    if memory > 0
                 ]
 
         # Hardcode max output length to 16
@@ -375,6 +386,7 @@ class ExllamaV2Container:
             # Set draft cache mode
             self.draft_cache_mode = unwrap(draft_args.get("draft_cache_mode"), "FP16")
 
+            # Edit the draft config size
             if chunk_size:
                 self.draft_config.max_input_len = chunk_size
                 self.draft_config.max_attention_size = chunk_size**2
@@ -619,21 +631,41 @@ class ExllamaV2Container:
 
             # Draft uses the autosplit loader, so create a cache that reflects this
             draft_cache_class = self.get_cache_class(self.draft_cache_mode)
-            self.draft_cache = self.create_cache(
-                cache_class=draft_cache_class,
-                autosplit=True,
-                use_tp=False,
-                model=self.draft_model,
-            )
 
-            for value in self.draft_model.load_autosplit_gen(
-                self.draft_cache,
-                reserve_vram=autosplit_reserve,
-                last_id_only=True,
-                callback_gen=progress_callback,
-            ):
-                if value:
-                    yield value
+            if self.draft_gpu_split:
+                logger.info("Loading with a manual GPU split (or a one GPU setup)")
+
+                for value in self.draft_model.load_gen(
+                    self.draft_gpu_split,
+                    callback_gen=progress_callback,
+                ):
+                    if value:
+                        yield value
+
+                self.draft_cache = self.create_cache(
+                    cache_class=draft_cache_class,
+                    autosplit=False,
+                    use_tp=False,
+                    model=self.draft_model,
+                )
+            else:
+                logger.info("Loading with autosplit")
+
+                self.draft_cache = self.create_cache(
+                    cache_class=draft_cache_class,
+                    autosplit=True,
+                    use_tp=False,
+                    model=self.draft_model,
+                )
+
+                for value in self.draft_model.load_autosplit_gen(
+                    self.draft_cache,
+                    reserve_vram=autosplit_reserve,
+                    last_id_only=True,
+                    callback_gen=progress_callback,
+                ):
+                    if value:
+                        yield value
 
             # Test VRAM allocation with a full-length forward pass
             input_ids = torch.zeros((1, self.config.max_input_len), dtype=torch.long)
@@ -659,8 +691,10 @@ class ExllamaV2Container:
         if self.use_tp:
             logger.info("Loading with tensor parallel")
 
+            # GPU split must be None if the array is empty
+            # Otherwise the TP loader fails
             for value in self.model.load_tp_gen(
-                self.gpu_split,
+                self.gpu_split or None,
                 callback_gen=progress_callback,
                 expect_cache_base=cache_class,
                 expect_cache_tokens=self.cache_size,
