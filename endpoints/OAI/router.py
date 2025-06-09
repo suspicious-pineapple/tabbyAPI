@@ -14,6 +14,7 @@ from endpoints.OAI.types.chat_completion import (
     ChatCompletionResponse,
 )
 from endpoints.OAI.types.embedding import EmbeddingsRequest, EmbeddingsResponse
+from endpoints.OAI.types.whisper import WhisperRequest, WhisperResponse
 from endpoints.OAI.utils.chat_completion import (
     apply_chat_template,
     generate_chat_completion,
@@ -25,6 +26,7 @@ from endpoints.OAI.utils.completion import (
     stream_generate_completion,
 )
 from endpoints.OAI.utils.embeddings import get_embeddings
+from endpoints.OAI.utils.whisper import get_whisper
 
 
 api_name = "OAI"
@@ -165,3 +167,20 @@ async def embeddings(request: Request, data: EmbeddingsRequest) -> EmbeddingsRes
     )
 
     return response
+
+
+@router.post(
+    "/v1/whisper",
+    dependencies=[Depends(check_api_key)],
+)
+async def embeddings(request: Request, data: WhisperRequest) -> WhisperResponse:
+       whisper_task = asyncio.create_task(get_whisper(data, request))
+       response =    await run_with_request_disconnect(
+              request,
+              whisper_task,
+              f"Whisper request {request.state.id} cancelled by user.",
+       )
+       return response
+
+
+
