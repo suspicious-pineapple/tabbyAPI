@@ -216,3 +216,4 @@ openapi.json
 
 # Backup files
 *.bak
+/unsloth_compiled_cache
