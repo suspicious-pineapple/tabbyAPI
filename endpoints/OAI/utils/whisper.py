@@ -48,7 +48,7 @@ from endpoints.OAI.types.whisper import UsageInfo, WhisperObject, WhisperRequest
 
 model = WhisperForConditionalGeneration.from_pretrained("openai/whisper-large-v3", low_cpu_mem_usage=True)
 peft_model = PeftModel.from_pretrained(model, "D:\models\whisper-large-v3-lora")
-featureextractor = WhisperFeatureExtractor.from_pretrained("openai/whisper-large-v3")
+#featureextractor = WhisperFeatureExtractor.from_pretrained("openai/whisper-large-v3")
 merged_model = peft_model.merge_and_unload()
 
 transcriber = pipeline(
@@ -56,9 +56,9 @@ transcriber = pipeline(
     model=merged_model,
     tokenizer="openai/whisper-large-v3",
     task="automatic-speech-recognition",
-    feature_extractor=featureextractor, 
+    feature_extractor="openai/whisper-large-v3", 
     torch_dtype=torch.bfloat16,
-    device=0,
+    #device=0,
 )
 
 #transcriber = pipeline(
@@ -123,6 +123,6 @@ async def get_whisper(data: WhisperRequest, request: Request) -> dict:
         usage=UsageInfo(prompt_tokens=0, total_tokens=0),
     )
 
-    logger.info(f"Finished embeddings request {request.state.id}")
+    logger.info(f"Finished whisper request {request.state.id}")
 
     return response
