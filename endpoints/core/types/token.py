@@ -1,7 +1,7 @@
 """Tokenization types"""
 
 from pydantic import BaseModel, Field, AliasChoices
-from typing import List, Union
+from typing import List, Union, Dict, Optional
 
 from endpoints.OAI.types.chat_completion import ChatCompletionMessage
 
