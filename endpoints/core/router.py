@@ -422,10 +422,11 @@ async def encode_tokens(data: TokenEncodeRequest) -> TokenEncodeResponse:
         template_vars = {
             "add_generation_prompt": False,
         }
-
+        if data.template_vars:
+            template_vars = template_vars | data.template_vars
         # Don't need template vars again
         text, mm_embeddings, _ = await format_messages_with_template(
-            data.text, template_vars, data.add_bos_token
+            data.text, template_vars
         )
     else:
         error_message = handle_request_error(
