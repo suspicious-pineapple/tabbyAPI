@@ -75,6 +75,24 @@ class ReasoningOptions(BaseModel):
     max_tokens: Optional[int] = None
 
 
+class TrainingSample(BaseModel):
+    messages: List[ChatCompletionMessage]
+    add_generation_prompt: Optional[bool] = False
+    template_vars: Optional[dict] = Field(
+        default={},
+        validation_alias=AliasChoices("template_vars", "chat_template_kwargs"),
+        description="Aliases: chat_template_kwargs",
+    )
+
+
+
+class TrainingRequest(BaseModel):
+    """
+    List lists of messages to train on.
+    """
+    samples: List[TrainingSample]
+
+
 # Inherited from common request
 class ChatCompletionRequest(CommonCompletionRequest):
     messages: List[ChatCompletionMessage]
