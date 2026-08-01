@@ -20,6 +20,7 @@ from common.templating import PromptTemplate, get_all_templates
 from common.utils import unwrap
 from common.health import HealthManager
 from endpoints.OAI.utils.chat_completion import format_messages_with_template
+from endpoints.OAI.types.chat_completion import TrainingRequest, TrainingResponse
 from endpoints.core.types.auth import AuthPermissionResponse
 from endpoints.core.types.download import DownloadRequest, DownloadResponse
 from endpoints.core.types.lora import LoraList, LoraLoadRequest, LoraLoadResponse
@@ -295,6 +296,23 @@ async def load_lora(data: LoraLoadRequest) -> LoraLoadResponse:
         success=unwrap(load_result.get("success"), []),
         failure=unwrap(load_result.get("failure"), []),
     )
+
+
+
+@router.post(
+    "/v1/lora/ingest",
+    dependencies=[Depends(check_admin_key), Depends(check_model_container)],
+)
+async def train_lora(data: TrainingRequest) -> TrainingResponse:
+    stats = await model.qlora.ingest(data.samples)
+    return TrainingResponse(
+        steps=stats.get("steps"),
+        loss=stats.get("mean_loss"),
+        duration=stats.get("duration"),
+        tokens=stats.get("total_tokens")
+    )
+
+
 
 
 # Unload lora endpoint

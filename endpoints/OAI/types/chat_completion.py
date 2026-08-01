@@ -92,6 +92,12 @@ class TrainingRequest(BaseModel):
     """
     samples: List[TrainingSample]
 
+class TrainingResponse(BaseModel):
+    loss: float
+    steps: int
+    tokens: int
+    duration: float
+
 
 # Inherited from common request
 class ChatCompletionRequest(CommonCompletionRequest):
