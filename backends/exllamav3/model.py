@@ -51,6 +51,9 @@ from endpoints.OAI.types.chat_completion import ChatCompletionLogprob, ChatCompl
 from endpoints.core.types.model import ModelCard, ModelCardParameters
 from endpoints.OAI.utils.tools import is_supported_format
 
+from exllamav3.training.realtime import RealtimeQLoRA, RealtimeConfig
+from backends.exllamav3.chat_jinja import (jinja_renderers, tokenizer_special_tokens, extract_rich_turns, row_template_extras, parse_template_vars)
+
 
 def _merge_stream_results(results: List[dict]) -> dict:
     """
@@ -623,6 +626,29 @@ class ExllamaV3Container:
         """Stub. Not currently tracking which LoRA are loaded""" # TODO: keep track of loaded loras?
         return []
 
+
+
+
+
+    def init_qlora(self,**kwargs):
+        seg_build, _, eot = jinja_renderers(self.model_dir, tokenizer_special_tokens(self.tokenizer), default_vars=self.template_vars_default)
+        def render_segments(sample):
+            turns = extract_rich_turns(sample["messages"])
+            return seg_build(turns, **row_template_extras(sample))
+
+        self.qlora = RealtimeQLoRA(
+            self.model, self.tokenizer,
+            RealtimeConfig(
+                r=4, alpha=6, target_modules=["q_proj", "o_proj", "gate_proj", "up_proj","down_proj"],
+                lr=4e-5, batch_size=1,grad_accum=1,seq_len=4096, checkpoint_dir="/mnt/d/lora_modles/realtime",
+                checkpoint_every=20, keep_checkpoints=0), adapter_dir=None,
+                render_segments=render_segments, base_model_name_or_path=self.model_dir,
+        )
+        self.qlora.attach_generator(self.generator.generator)
+        xlogger.info("initialized trainable adapter")
+        xlogger.info(f" -- realtime adapter: {self.qlora.net.num_trainable():,} trainable params, "
+          f"lr {self.qlora.lr:g}, targets {' '.join(self.qlora.net.target_modules)}")
+
     async def load_gen(self, progress_callback=None, **kwargs):
         """
         Loads the model into memory, yielding progress updates.
@@ -656,6 +682,7 @@ class ExllamaV3Container:
             # Cleanup and update model load state
             self.loaded = True
             xlogger.info("Model successfully loaded.")
+            self.init_qlora()
         finally:
             self.load_lock.release()
 
@@ -728,6 +755,7 @@ class ExllamaV3Container:
                 num_draft_tokens=self.draft_num_tokens,
                 dynamic_draft_tokens=self.dynamic_draft,
                 ngram_match_min=self.ngram_match_min,
+                show_visualizer=True
             )
 
             # Update the state of the container var
