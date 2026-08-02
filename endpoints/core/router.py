@@ -304,11 +304,12 @@ async def load_lora(data: LoraLoadRequest) -> LoraLoadResponse:
     dependencies=[Depends(check_admin_key), Depends(check_model_container)],
 )
 async def train_lora(data: TrainingRequest) -> TrainingResponse:
+    print("ingesting training data")
     stats = model.container.qlora.ingest(data.model_dump(mode="python").get("samples"))
     print(stats)
     return TrainingResponse(
         loss=stats.get("mean_loss"),
-        duration=stats.get("duration"),
+        duration=stats.get("duration_s"),
     )
 
 
