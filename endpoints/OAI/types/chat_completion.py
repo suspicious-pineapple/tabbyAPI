@@ -93,8 +93,6 @@ class TrainingRequest(BaseModel):
 
 class TrainingResponse(BaseModel):
     loss: float
-    steps: int
-    tokens: int
     duration: float
 
 

@@ -307,10 +307,8 @@ async def train_lora(data: TrainingRequest) -> TrainingResponse:
     stats = model.container.qlora.ingest(data.model_dump(mode="python").get("samples"))
     print(stats)
     return TrainingResponse(
-        steps=stats.get("steps"),
         loss=stats.get("mean_loss"),
         duration=stats.get("duration"),
-        tokens=stats.get("total_tokens")
     )
 
 
