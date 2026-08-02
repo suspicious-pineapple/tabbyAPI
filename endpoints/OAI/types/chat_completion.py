@@ -77,7 +77,6 @@ class ReasoningOptions(BaseModel):
 
 class TrainingSample(BaseModel):
     messages: List[ChatCompletionMessage]
-    add_generation_prompt: Optional[bool] = False
     template_vars: Optional[dict] = Field(
         default={},
         validation_alias=AliasChoices("template_vars", "chat_template_kwargs"),

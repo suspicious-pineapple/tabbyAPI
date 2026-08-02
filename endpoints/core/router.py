@@ -304,7 +304,8 @@ async def load_lora(data: LoraLoadRequest) -> LoraLoadResponse:
     dependencies=[Depends(check_admin_key), Depends(check_model_container)],
 )
 async def train_lora(data: TrainingRequest) -> TrainingResponse:
-    stats = await model.qlora.ingest(data.samples)
+    stats = model.container.qlora.ingest(data.model_dump(mode="python").get("samples"))
+    print(stats)
     return TrainingResponse(
         steps=stats.get("steps"),
         loss=stats.get("mean_loss"),
