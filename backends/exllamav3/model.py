@@ -173,7 +173,7 @@ class ExllamaV3Container:
         self = cls()
 
         # Make sure ExllamaV3 is up to date
-        check_package_version("exllamav3", "1.3.0")
+        check_package_version("exllamav3", "1.4.1")
 
         self.model_dir = model_directory
         self.hf_model = hf_model
@@ -1164,6 +1164,10 @@ class ExllamaV3Container:
 
         sampler_builder = ExllamaV3SamplerBuilder()
 
+        # Apply logit bias first so it lands ahead of the other steps
+        if params.logit_bias:
+            sampler_builder.logit_bias(params.logit_bias)
+
         # Penalties
 
         # Set penalty range
@@ -1195,6 +1199,10 @@ class ExllamaV3Container:
             ),  # TODO: Allow decay = 0 when exl3 kernel fix is pushed (v0.0.27)
         )
 
+        # Ban tokens
+        if params.banned_tokens:
+            sampler_builder.ban_tokens(params.banned_tokens)
+
         # Apply temperature first to builder
         if not params.temperature_last:
             sampler_builder.temperature(params.temperature)
@@ -1207,6 +1215,10 @@ class ExllamaV3Container:
         # Apply temperature last to builder
         if params.temperature_last:
             sampler_builder.temperature(params.temperature)
+
+        # Apply XTC to the final distribution
+        if params.xtc_probability > 0.0:
+            sampler_builder.xtc(params.xtc_probability, params.xtc_threshold, self.tokenizer)
 
         # Apply adaptive-P
         if params.adaptive_target < 1.0:
@@ -1305,7 +1317,7 @@ class ExllamaV3Container:
                 )
 
             if params.grammar_string:
-                grammar_handler.add_kbnf_filter(
+                grammar_handler.add_grammar_filter(
                     params.grammar_string, self.tokenizer, trigger_token_id=trigger_token_id
                 )
 

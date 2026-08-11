@@ -6,7 +6,10 @@ from sse_starlette import EventSourceResponse
 
 from common import model
 from common.auth import check_api_key
-from common.debug_requests import log_chat_completion_request
+from common.debug_requests import (
+    log_chat_completion_request,
+    write_chat_completion_prompt_log,
+)
 from common.model import check_embeddings_container, check_model_container
 from common.networking import (
     get_sse_ping_interval,
@@ -65,13 +68,12 @@ async def completion_request(request: Request, data: CompletionRequest) -> Compl
     raw_json = await request.json()
     xlogger.debug("[ENDPOINT] /v1/completions", {"raw": raw_json})
 
-    await load_lock.acquire()
-    if data.model:
-        await load_inline_model(data.model, request)
-    else:
-        await check_model_container()
-    model_path = model.container.model_dir
-    load_lock.release()
+    async with load_lock:
+        if data.model:
+            await load_inline_model(data.model, request)
+        else:
+            await check_model_container()
+        model_path = model.container.model_dir
 
     # Prepare raw prompt (will be str or list[str])
     prompt = data.prompt
@@ -121,13 +123,12 @@ async def chat_completion_request(
     raw_json = await request.json()
     xlogger.debug("[ENDPOINT] /v1/chat/completions", {"raw": raw_json})
 
-    await load_lock.acquire()
-    if data.model:
-        await load_inline_model(data.model, request)
-    else:
-        await check_model_container()
-    model_path = model.container.model_dir
-    load_lock.release()
+    async with load_lock:
+        if data.model:
+            await load_inline_model(data.model, request)
+        else:
+            await check_model_container()
+        model_path = model.container.model_dir
 
     # Prepare raw prompt
     if model.container.prompt_template is None:
@@ -137,6 +138,7 @@ async def chat_completion_request(
         ).error.message
         raise HTTPException(422, error_message)
     prompt, mm_embeddings = await apply_chat_template(data)
+    await write_chat_completion_prompt_log(request, prompt)
 
     # Set an empty JSON schema if the request wants a JSON response
     if data.response_format.type == "json":
