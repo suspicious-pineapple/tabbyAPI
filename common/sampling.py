@@ -24,17 +24,14 @@ from common.utils import filter_none_values, unwrap
 # Requests that activate any of these get a warning and the param is ignored.
 UNSUPPORTED_PARAMS = {
     "ban_eos_token": False,
-    "banned_tokens": [],
     "allowed_tokens": [],
     "smoothing_factor": 0.0,
     "top_a": 0.0,
     "tfs": 1.0,
     "typical": 1.0,
     "skew": 0.0,
-    "xtc_probability": 0.0,
     "dry_multiplier": 0.0,
     "mirostat_mode": 0,
-    "logit_bias": None,
     "temp_exponent": 1.0,
 }
 
@@ -140,10 +137,14 @@ class BaseSamplerRequest(BaseModel):
 
     xtc_probability: Optional[float] = Field(
         default_factory=lambda: get_default_sampler_value("xtc_probability", 0.0),
+        ge=0.0,
+        le=1.0,
     )
 
     xtc_threshold: Optional[float] = Field(
-        default_factory=lambda: get_default_sampler_value("xtc_threshold", 0.1)
+        default_factory=lambda: get_default_sampler_value("xtc_threshold", 0.1),
+        ge=0.0,
+        le=1.0,
     )
 
     frequency_penalty: Optional[float] = Field(
@@ -242,6 +243,10 @@ class BaseSamplerRequest(BaseModel):
 
     grammar_string: Optional[str] = Field(
         default_factory=lambda: get_default_sampler_value("grammar_string"),
+        description=(
+            "Constrain generation with a context-free grammar in Lark or "
+            "llama.cpp GBNF syntax (auto-detected)."
+        ),
     )
 
     max_temp: Optional[float] = Field(
