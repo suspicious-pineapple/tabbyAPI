@@ -244,7 +244,7 @@ class ModelConfig(BaseConfigModel):
         default_factory=list,
         description=(
             "Array of VRAM sizes to split between GPUs, in GB (default: []).\n"
-            "Used with tensor parallelism."
+            "Used both with and without tensor parallelism."
         ),
     )
     cpu_moe_offload_layers: Optional[int] = Field(
@@ -369,6 +369,29 @@ class ModelConfig(BaseConfigModel):
             "plain reasoning text."
         ),
     )
+    reasoning_budget_tokens: Optional[int] = Field(
+        None,
+        description=(
+            "Default reasoning token budget (default: None).\n"
+            "When a request's reasoning content exceeds the budget, the server\n"
+            "forces the end of the reasoning phase by injecting\n"
+            "reasoning_budget_message followed by the model's end-of-reasoning\n"
+            "tokens. 0 ends reasoning as soon as it starts; None or a negative\n"
+            "value disables the budget. Overridable per request via\n"
+            "reasoning_budget_tokens (aliases: reasoning_budget,\n"
+            "thinking_budget, thinking_token_budget) or reasoning.max_tokens.\n"
+            "Requires a reasoning format: reasoning tags, Harmony or Muse\n"
+            "Glimmer."
+        ),
+    )
+    reasoning_budget_message: Optional[str] = Field(
+        None,
+        description=(
+            "Text injected before the end-of-reasoning tokens when the\n"
+            "reasoning budget is exhausted (default: no text, only the end-of-reasoning\n"
+            "tokens are forced). Overridable per request via reasoning_budget_message."
+        ),
+    )
     tool_format: Optional[str] = Field(
         None,
         description=(
@@ -382,6 +405,16 @@ class ModelConfig(BaseConfigModel):
             "Parse responses in the Harmony message format (gpt-oss models).\n"
             "Auto-detected from the model's special tokens by default; set to\n"
             "true or false to override. Setting 'tool_format: harmony' is\n"
+            "equivalent to setting this to true. When active, supersedes the\n"
+            "reasoning and tool format settings."
+        ),
+    )
+    muse_glimmer: Optional[bool] = Field(
+        None,
+        description=(
+            "Parse responses in the Muse Glimmer message format.\n"
+            "Auto-detected from the model's special tokens by default; set to\n"
+            "true or false to override. Setting 'tool_format: muse_glimmer' is\n"
             "equivalent to setting this to true. When active, supersedes the\n"
             "reasoning and tool format settings."
         ),
