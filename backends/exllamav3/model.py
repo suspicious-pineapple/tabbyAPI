@@ -91,6 +91,9 @@ class ExllamaV3Container:
     prompt_template: Optional[PromptTemplate] = None
     tool_format: Optional[str] = None
     harmony: bool = False
+    muse_glimmer: bool = False
+    reasoning_budget_tokens: Optional[int] = None
+    reasoning_budget_message: Optional[str] = None
 
     # Optional features
     use_draft_model: bool = False
@@ -410,6 +413,10 @@ class ExllamaV3Container:
         self.reasoning_end_token = kwargs.get("reasoning_end_token", "</think>")
         self.tool_calls_in_reasoning = kwargs.get("tool_calls_in_reasoning", True)
 
+        # Reasoning budget defaults, overridable per request
+        self.reasoning_budget_tokens = kwargs.get("reasoning_budget_tokens")
+        self.reasoning_budget_message = kwargs.get("reasoning_budget_message")
+
         # Default and forced chat template variables
         self.template_vars_default = kwargs.get("template_vars_default") or {}
         self.template_vars_force = kwargs.get("template_vars_force") or {}
@@ -457,6 +464,44 @@ class ExllamaV3Container:
                 xlogger.warning(
                     "Harmony supersedes the reasoning and tool format settings "
                     "in the model config; they will be ignored."
+                )
+
+        # Muse Glimmer message format. Like Harmony, the message structure is
+        # baked into the checkpoint's special tokens, so auto-detect from the
+        # tokenizer unless overridden in config. The token sets are disjoint
+        # (Glimmer has no <|channel|>, Harmony no <|eom|>/<|eot|>), so the
+        # two auto-detections cannot both trigger.
+        glimmer = kwargs.get("muse_glimmer")
+        if self.tool_format in ("muse_glimmer", "glimmer"):
+            # Glimmer isn't a tag-based tool format; selecting it as one
+            # enables full Glimmer parsing
+            if glimmer is False:
+                xlogger.warning(
+                    f"tool_format: {self.tool_format} has no effect when "
+                    "muse_glimmer is set to false; tool calls will not be parsed."
+                )
+            else:
+                glimmer = True
+        if glimmer is None:
+            glimmer = not self.harmony and all(
+                self.tokenizer.single_id(token) is not None
+                for token in ("<|start|>", "<|message|>", "<|eom|>", "<|eot|>")
+            )
+        if glimmer and self.harmony:
+            xlogger.warning(
+                "Both harmony and muse_glimmer are enabled; using Harmony "
+                "and ignoring muse_glimmer."
+            )
+            glimmer = False
+        self.muse_glimmer = bool(glimmer)
+        if self.muse_glimmer:
+            xlogger.info("Using the Muse Glimmer format for reasoning and tool call parsing.")
+            if self.reasoning or (
+                self.tool_format and self.tool_format not in ("muse_glimmer", "glimmer")
+            ):
+                xlogger.warning(
+                    "Muse Glimmer supersedes the reasoning and tool format "
+                    "settings in the model config; they will be ignored."
                 )
 
         return self
@@ -1045,6 +1090,40 @@ class ExllamaV3Container:
         finally:
             # Clean up and remove the job from active IDs
             del self.active_job_ids[request_id]
+
+    def constrain_generation_output(self, request_id: str, text: str) -> bool:
+        """
+        Force `text` into the output stream of an active generation job: the
+        next sampled tokens are constrained to the given string, then sampling
+        resumes. Used to end the reasoning phase when a reasoning budget is
+        exhausted. Returns False if the job is not running or the installed
+        exllamav3 version does not support output constraints.
+        """
+
+        job = self.active_job_ids.get(request_id)
+        if job is None:
+            return False
+
+        # TODO: Call directly once the minimum exllamav3 version requirement
+        #       includes AsyncJob.constrain_output_now
+        if not hasattr(job, "constrain_output_now"):
+            xlogger.warning(
+                "The installed exllamav3 version does not support output "
+                "constraints; the reasoning budget is ignored."
+            )
+            return False
+
+        # Encode here rather than passing the string through: tokenizers with
+        # a BOS post-processor (Llama-3 style) prepend BOS regardless of
+        # add_bos, which would corrupt the injection
+        ids = self.tokenizer.encode(text, encode_special_tokens=True, add_bos=False)
+        if ids.shape[-1] > 0 and ids[0, 0].item() == self.tokenizer.bos_token_id:
+            ids = ids[:, 1:]
+        if ids.shape[-1] == 0:
+            return False
+
+        job.constrain_output_now(ids)
+        return True
 
     def handle_logprobs(self, result: dict, generation: dict):
         """
