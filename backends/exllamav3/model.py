@@ -687,7 +687,7 @@ class ExllamaV3Container:
                 r=4, alpha=6, target_modules=["q_proj", "o_proj", "gate_proj", "up_proj","down_proj"],
                 lr=4e-5, batch_size=1,grad_accum=1,seq_len=4096, checkpoint_dir="/mnt/d/lora_modles/realtime",
                 checkpoint_every=20, keep_checkpoints=0), adapter_dir=None,
-                render_segments=render_segments, base_model_name_or_path=self.model_dir,
+                render_segments=render_segments, base_model_name_or_path=str(self.model_dir),
         )
         self.qlora.attach_generator(self.generator.generator)
         xlogger.info("initialized trainable adapter")
