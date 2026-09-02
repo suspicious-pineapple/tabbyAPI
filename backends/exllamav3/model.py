@@ -176,7 +176,7 @@ class ExllamaV3Container:
         self = cls()
 
         # Make sure ExllamaV3 is up to date
-        check_package_version("exllamav3", "1.4.1")
+        check_package_version("exllamav3", "1.4.4")
 
         self.model_dir = model_directory
         self.hf_model = hf_model
@@ -187,12 +187,44 @@ class ExllamaV3Container:
         # Set CPU offload layers
         self.config.infer_params.moe_cpu_offload = unwrap(kwargs.get("cpu_moe_offload_layers"), 0)
 
+        # Per-layer expert split: the tail N routed experts of every eligible
+        # MoE layer run on the CPU, with dynamic placement keeping hot experts
+        # in VRAM
+        cpu_moe_split_experts = unwrap(kwargs.get("cpu_moe_split_experts"), 0)
+        if cpu_moe_split_experts:
+            if self.config.infer_params.moe_cpu_offload:
+                raise ValueError(
+                    "cpu_moe_split_experts and cpu_moe_offload_layers are "
+                    "mutually exclusive: the split offloads part of every MoE "
+                    "layer instead of whole layers."
+                )
+            if unwrap(kwargs.get("tensor_parallel"), False):
+                raise ValueError("cpu_moe_split_experts is not supported with tensor parallelism.")
+            self.config.infer_params.moe_cpu_split = cpu_moe_split_experts
+
+        # Worker thread count for both CPU MoE modes; None defers to the
+        # EXL3_MOE_CPU_THREADS env variable, then half the CPU core count
+        cpu_moe_threads = kwargs.get("cpu_moe_threads")
+        if cpu_moe_threads is not None:
+            self.config.infer_params.moe_cpu_threads = cpu_moe_threads
+
+        # Load an n-gram embedding table (PLE models) fully into system RAM
+        # instead of streaming rows from disk per forward. Must be set before
+        # the model weights are loaded
+        if unwrap(kwargs.get("ngram_ram"), False):
+            self.config.infer_params.ngram_stream_from_disk = False
+            xlogger.info("Loading n-gram embeddings into system RAM (ngram_ram).")
+
         # Prepare vision model if requested in config
         self.vision_model = None
         self.use_vision = kwargs.get("vision", False)
+        # Must be set before the vision component is loaded
+        self.config.infer_params.vision_pinned = unwrap(kwargs.get("vision_offload"), False)
         if self.use_vision:
             if "vision" in self.config.model_classes:
                 self.vision_model = Model.from_config(self.config, component="vision")
+                if self.config.infer_params.vision_pinned:
+                    xlogger.info("Keeping vision model weights in system RAM (vision_offload).")
             else:
                 xlogger.warning(
                     "The provided model does not have vision capabilities that are "
