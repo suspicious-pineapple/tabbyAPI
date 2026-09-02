@@ -768,6 +768,15 @@ class ExllamaV3Container:
                 # Immediately cancel all jobs
                 await self.wait_for_jobs(skip_wait=True)
 
+                # Retire the previous generator before replacing it. Cancelling the
+                # jobs alone leaves its iteration task alive, parked on an emptied
+                # job condition that nothing will ever signal again, which keeps the
+                # old sync Generator reachable for the life of the process. close()
+                # stops the task and wakes any consumer still parked on a job queue.
+                # After a latch the task has already exited, so this is a no-op there.
+                if self.generator is not None:
+                    await self.generator.close()
+
             # Create new generator
             self.generator = AsyncGenerator(
                 model=self.model,
@@ -1512,17 +1521,40 @@ class ExllamaV3Container:
                 await job.cancel()
 
         except Exception as ex:
-            # Create a new generator since the current state is broken
-            # No need to wait for this to finish
-            xlogger.error(
-                "FATAL ERROR with generation. "
-                "Attempting to recreate the generator. "
-                "If this fails, please restart the server.\n",
-                {"exception": str(ex)},
+            # Only recreate when the AsyncGenerator has latched (its error is set), meaning the
+            # failure escaped Generator.iterate() and the generator is unusable. Errors that
+            # exllamav3 contained and delivered to this request alone leave the generator healthy;
+            # recreating it anyway cancels every other in-flight request (wait_for_jobs) and
+            # returns their partial or empty completions with HTTP 200.
+            # An engine whose AsyncGenerator has no latch attribute cannot be inspected;
+            # keep the historical behaviour (always recreate) rather than guess.
+            latched = (
+                self.generator is None
+                or not hasattr(self.generator, "error")
+                or self.generator.error is not None
             )
-            asyncio.ensure_future(self.create_generator())
+            if latched:
+                xlogger.error(
+                    "FATAL ERROR with generation. "
+                    "Attempting to recreate the generator. "
+                    "If this fails, please restart the server.\n",
+                    {"exception": str(ex)},
+                )
+                asyncio.ensure_future(self.create_generator())
 
-            await HealthManager.add_unhealthy_event(ex)
+                await HealthManager.add_unhealthy_event(ex)
+            else:
+                xlogger.warning(
+                    "Generation failed; error was contained to this request and the "
+                    "generator is still healthy.",
+                    {"exception": str(ex)},
+                )
+                # The job may still be running in the generator if the error came from
+                # this consumer rather than the engine. Cancel it so it does not keep
+                # generating into a queue nobody drains. If the engine already reaped
+                # it, cancel() is a no-op. Recreation used to do this as a side effect.
+                if not job.cancelled:
+                    await job.cancel()
 
             if isinstance(ex, AssertionError) and "cannot be enqueued" in str(ex):
                 raise ContextLengthExceededError(
