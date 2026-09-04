@@ -81,6 +81,15 @@ class NetworkConfig(BaseConfigModel):
         ),
         ge=0,
     )
+    access_log: Optional[bool] = Field(
+        False,
+        description=(
+            "Log every HTTP request with client address, method, path and status "
+            "(default: False).\n"
+            "Generation requests are already logged in detail; this adds the rest, "
+            "such as model list and health polls."
+        ),
+    )
 
     # Converts all strings in the api_servers list to lowercase
     # NOTE: Expand if more models need this validator

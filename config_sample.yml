@@ -36,6 +36,10 @@ network:
   # connections from dropping during long prefills. Set to 0 to disable.
   sse_ping_interval: 15
 
+  # Log every HTTP request with client address, method, path and status (default: False).
+  # Generation requests are already logged in detail; this adds the rest, such as model list and health polls.
+  access_log: false
+
 # Options for logging
 logging:
   # Enable prompt logging (default: False).

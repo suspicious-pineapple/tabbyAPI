@@ -119,6 +119,14 @@ UVICORN_LOG_CONFIG = {
         },
     },
     "root": {"handlers": ["uvicorn"], "propagate": False, "level": LOG_LEVEL},
+    # Uvicorn's startup chatter duplicates what TabbyAPI already logs, so only
+    # its warnings and errors get through. Access lines are gated separately by
+    # the network.access_log option
+    "loggers": {
+        "uvicorn": {"level": "WARNING"},
+        "uvicorn.error": {"level": "WARNING"},
+        "uvicorn.access": {"level": LOG_LEVEL},
+    },
 }
 
 
