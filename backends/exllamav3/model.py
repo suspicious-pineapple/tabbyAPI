@@ -372,7 +372,6 @@ class ExllamaV3Container:
         cache_size_default = max_seq_len
 
         if cache_size_user:
-            xlogger.info(f"Using configured cache_size: {cache_size_user} tokens.")
             cache_size = cache_size_user
         else:
             xlogger.warning(
@@ -390,6 +389,11 @@ class ExllamaV3Container:
 
         self.max_seq_len = max_seq_len
         self.cache_size = cache_size
+
+        xlogger.info(
+            f"Context: max_seq_len {max_seq_len:,} tokens ({max_seq_len_source}), "
+            f"cache_size {cache_size:,} tokens"
+        )
 
         # Max batch size
         default_mbs = 4 if self.model.caps.get("recurrent_states") else 128
@@ -718,6 +722,7 @@ class ExllamaV3Container:
             # Wait for existing generation jobs to finish
             await self.wait_for_jobs(kwargs.get("skip_wait"))
 
+            load_start = time.perf_counter()
             generator = self.load_model_sync(progress_callback)
             async for value in iterate_in_threadpool(generator):
                 yield value
@@ -732,7 +737,7 @@ class ExllamaV3Container:
 
             # Cleanup and update model load state
             self.loaded = True
-            xlogger.info("Model successfully loaded.")
+            xlogger.info(f"Model loaded in {time.perf_counter() - load_start:.1f} s")
         finally:
             self.load_lock.release()
 
@@ -759,14 +764,14 @@ class ExllamaV3Container:
                 if value:
                     yield value
 
-        xlogger.info("Loading model: " + str(self.model_dir))
-
         if self.use_tp:
-            xlogger.info("Loading with tensor parallel")
+            split_mode = "tensor parallel"
         elif self.gpu_split_auto:
-            xlogger.info("Loading with autosplit")
+            split_mode = "autosplit"
         else:
-            xlogger.info("Loading with a manual GPU split (or a one GPU setup)")
+            split_mode = "manual GPU split"
+
+        xlogger.info(f"Loading model {self.model_dir} ({split_mode})")
 
         for value in self.model.load_gen(
             tensor_p=self.use_tp,

@@ -216,8 +216,6 @@ def find_template_from_model(model_path: pathlib.Path):
 async def find_prompt_template(template_name, model_dir: pathlib.Path):
     """Tries to find a prompt template using various methods."""
 
-    xlogger.info("Attempting to load a prompt template if present.")
-
     find_template_functions = [
         lambda: PromptTemplate.from_file(model_dir / "chat_template.jinja"),
         lambda: PromptTemplate.from_model_json(

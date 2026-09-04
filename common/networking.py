@@ -141,10 +141,10 @@ class DisconnectHandler:
 
         # Log and raise
         if not self._reported:
-            xlogger.error(f"Request disconnected: {self.description}")
+            xlogger.warning(f"{self.description}: client disconnected, generation cancelled")
             self._reported = True
 
-        raise asyncio.CancelledError(f"Request disconnected: {self.description}")
+        raise asyncio.CancelledError(f"{self.description}: client disconnected")
 
     async def add_cleanup_task(self, key, func, args):
         # Intentionally strict

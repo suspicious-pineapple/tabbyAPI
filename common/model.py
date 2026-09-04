@@ -220,11 +220,10 @@ async def load_model_gen(model_path: pathlib.Path, **kwargs):
                 yield module, modules, current_model_type
 
                 if module == modules:
-                    # Switch to model progress if the draft model is loaded
+                    # Move on to the next component; the last one ends the bars
+                    index += 1
                     if index == len(model_type):
                         progress.stop()
-                    else:
-                        index += 1
 
             container = new_container
         finally:
