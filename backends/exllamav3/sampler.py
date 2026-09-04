@@ -1,5 +1,7 @@
 from dataclasses import dataclass, field
-from typing import List
+from typing import List, Tuple
+from common.sampling import BaseSamplerRequest
+from common.utils import coalesce, unwrap
 from exllamav3.generator.sampler import (
     CustomSampler,
     SS_Temperature,
@@ -32,6 +34,100 @@ class ExllamaV3SamplerBuilder:
     """
 
     stack: List[SS_Base] = field(default_factory=list)
+
+    # (request field, display value) for every setting that shaped the stack.
+    # Neutral values are left out, so this lists what the sampler actually does.
+    settings: List[Tuple[str, object]] = field(default_factory=list)
+
+    @classmethod
+    def from_params(cls, params: BaseSamplerRequest, tokenizer, max_seq_len: int):
+        """Build the sampler stack for a request and record the settings in effect."""
+
+        builder = cls()
+        settings = builder.settings
+        greedy = params.temperature == 0
+
+        # Logit bias first so it lands ahead of the other steps
+        if params.logit_bias and builder.logit_bias(params.logit_bias):
+            settings.append(("logit_bias", f"{len(params.logit_bias)} tokens"))
+
+        # Penalties. Range -1 means the whole context (exl3 takes a large number)
+        penalty_range = unwrap(params.penalty_range, max_seq_len)
+        if penalty_range < 0:
+            penalty_range = int(10e7)
+
+        fallback_decay = 0 if unwrap(params.penalty_range, -1) < 0 else params.penalty_range
+        repetition_decay = coalesce(params.repetition_decay, fallback_decay, 0)
+
+        builder.penalties(
+            params.repetition_penalty,
+            params.frequency_penalty,
+            params.presence_penalty,
+            penalty_range,
+            max(repetition_decay, 1),  # TODO: Allow decay = 0 when exl3 kernel fix is pushed
+        )
+
+        penalties_active = False
+        if params.repetition_penalty != 1.0:
+            settings.append(("repetition_penalty", params.repetition_penalty))
+            penalties_active = True
+        if params.frequency_penalty:
+            settings.append(("frequency_penalty", params.frequency_penalty))
+            penalties_active = True
+        if params.presence_penalty:
+            settings.append(("presence_penalty", params.presence_penalty))
+            penalties_active = True
+        if penalties_active:
+            if unwrap(params.penalty_range, -1) >= 0:
+                settings.append(("penalty_range", params.penalty_range))
+            if params.repetition_decay:
+                settings.append(("repetition_decay", params.repetition_decay))
+
+        if params.banned_tokens:
+            builder.ban_tokens(params.banned_tokens)
+            settings.append(("banned_tokens", f"{len(params.banned_tokens)} tokens"))
+
+        # Probability-shaping steps. Under greedy decoding these never change the
+        # argmax and build() drops them, so they are not reported either
+        shaping = []
+
+        if not params.temperature_last:
+            builder.temperature(params.temperature)
+
+        builder.top_k(params.top_k)
+        builder.top_p(params.top_p)
+        builder.min_p(params.min_p)
+
+        if params.temperature_last:
+            builder.temperature(params.temperature)
+
+        if params.temperature != 1.0:
+            shaping.append(("temperature", params.temperature))
+        if params.top_k > 0:
+            shaping.append(("top_k", params.top_k))
+        if params.top_p < 1.0:
+            shaping.append(("top_p", params.top_p))
+        if params.min_p > 0:
+            shaping.append(("min_p", params.min_p))
+        if params.temperature_last and params.temperature != 1.0:
+            shaping.append(("temperature_last", True))
+
+        if params.xtc_probability > 0.0:
+            builder.xtc(params.xtc_probability, params.xtc_threshold, tokenizer)
+            shaping.append(("xtc_probability", params.xtc_probability))
+            shaping.append(("xtc_threshold", params.xtc_threshold))
+
+        if params.adaptive_target < 1.0:
+            builder.adaptive_p(params.adaptive_target, params.adaptive_decay)
+            shaping.append(("adaptive_target", params.adaptive_target))
+            shaping.append(("adaptive_decay", params.adaptive_decay))
+
+        if greedy and not (shaping and shaping[-1][0] == "adaptive_decay"):
+            settings.append(("temperature", "0, greedy"))
+        else:
+            settings.extend(shaping)
+
+        return builder
 
     def logit_bias(self, logit_bias) -> bool:
         """Returns False when the installed exllamav3 lacks SS_LogitBias."""

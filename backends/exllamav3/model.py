@@ -2,6 +2,7 @@ import asyncio
 import gc
 import pathlib
 import re
+import time
 from asyncio import CancelledError
 
 import torch
@@ -29,9 +30,11 @@ from backends.exllamav3.utils import exllama_supports_nccl
 from backends.exllamav3.vision import clear_image_embedding_cache
 from common.concurrency import iterate_in_threadpool
 from common.gen_logging import (
+    format_settings,
     log_generation_params,
     log_metrics,
     log_prompt,
+    log_request_start,
 )
 from common.hardware import hardware_supports_exllamav3
 from common.health import HealthManager
@@ -44,7 +47,7 @@ from common.sampling import BaseSamplerRequest
 from common.tabby_config import config
 from common.templating import PromptTemplate, find_prompt_template
 from common.transformers_utils import HFModel
-from common.utils import coalesce, unwrap
+from common.utils import unwrap
 from endpoints.OAI.types.chat_completion import ChatCompletionLogprob, ChatCompletionLogprobLeaf
 from endpoints.core.types.model import ModelCard, ModelCardParameters
 from endpoints.OAI.utils.tools import is_supported_format
@@ -352,16 +355,17 @@ class ExllamaV3Container:
         max_seq_len_default = 8192
 
         if max_seq_len_model and not max_seq_len_user:
-            xlogger.info(f"Using default max_seq_len from model: {max_seq_len_model} tokens.")
+            max_seq_len_source = "model default"
             max_seq_len = max_seq_len_model
         elif max_seq_len_user:
-            xlogger.info(f"Using configured max_seq_len: {max_seq_len_user} tokens.")
+            max_seq_len_source = "configured"
             max_seq_len = max_seq_len_user
         else:
             xlogger.warning(
                 f"max_seq_len is undefined. Defaulting to {max_seq_len_default} tokens."
             )
             max_seq_len = max_seq_len_default
+            max_seq_len_source = "fallback"
 
         cache_size_user = kwargs.get("cache_size")
         cache_size_default = max_seq_len
@@ -1043,6 +1047,7 @@ class ExllamaV3Container:
         disconnect_handler: DisconnectHandler = None,
         mm_embeddings: Optional[MultimodalEmbeddingWrapper] = None,
         filter_trigger: str = None,
+        label: Optional[str] = None,
     ) -> AsyncIterator[Dict[str, Any]]:
         """
         Generates a response iteratively (streaming) for a given prompt.
@@ -1055,6 +1060,7 @@ class ExllamaV3Container:
             mm_embeddings: Optional multimodal embeddings.
             filter_trigger: Delay filters (from params) until trigger text.
                 Must map to single token.
+            label: Short name for the request in console logs.
 
         Yields:
             Generation chunks
@@ -1083,6 +1089,7 @@ class ExllamaV3Container:
                 disconnect_handler=disconnect_handler,
                 mm_embeddings=mm_embeddings,
                 filter_trigger=filter_trigger,
+                label=label,
             ):
                 yield generation_chunk
         finally:
@@ -1170,8 +1177,11 @@ class ExllamaV3Container:
 
         generation["logprobs_content"] = content
 
-    def handle_finish_chunk(self, result: dict, request_id: str, full_text: str):
+    def handle_finish_chunk(
+        self, result: dict, request_id: str, full_text: str, label: Optional[str] = None
+    ):
         eos_reason = result.get("eos_reason")
+        label = label or f"request {request_id}"
 
         stop_str = None
         if eos_reason == "max_new_tokens":
@@ -1185,7 +1195,7 @@ class ExllamaV3Container:
                 stop_str = result.get("eos_triggering_string")
             elif eos_reason == "loop_detected":
                 xlogger.warning(
-                    f"Generation stopped because a token loop was detected, ID: {request_id}",
+                    f"{label}: generation stopped because a token loop was detected",
                     {
                         "request_id": request_id,
                         "eos_reason": eos_reason,
@@ -1254,6 +1264,7 @@ class ExllamaV3Container:
         disconnect_handler: DisconnectHandler = None,
         mm_embeddings: Optional[MultimodalEmbeddingWrapper] = None,
         filter_trigger: str = None,
+        label: Optional[str] = None,
     ):
         """
         Create generator function for prompt completion.
@@ -1261,77 +1272,19 @@ class ExllamaV3Container:
         for kwargs, check common/sampling.py
         """
         chunk_tokens: torch.Tensor | tuple[torch.Tensor, torch.Tensor]
+        label = label or f"request {request_id}"
 
         xlogger.debug(
             f"Starting generation, ID: {request_id}",
             {"request_id": request_id, "params": params.model_dump(mode="json")},
         )
 
-        sampler_builder = ExllamaV3SamplerBuilder()
-
-        # Apply logit bias first so it lands ahead of the other steps
-        if params.logit_bias:
-            sampler_builder.logit_bias(params.logit_bias)
-
-        # Penalties
-
-        # Set penalty range
-        penalty_range = unwrap(params.penalty_range, self.max_seq_len)
-
-        # Exl3's version of including the entire context
-        if penalty_range < 0:
-            penalty_range = int(10e7)
-
-        # Always make sure the fallback is 0 if range < 0
-        # It's technically fine to use -1, but this just validates the passed
-        # fallback
-        # Always default to 0 if something goes wrong
-        if params.penalty_range < 0:
-            fallback_decay = 0
-        else:
-            fallback_decay = params.penalty_range
-
-        repetition_decay = coalesce(params.repetition_decay, fallback_decay, 0)
-
-        # Apply penalties to builder
-        sampler_builder.penalties(
-            params.repetition_penalty,
-            params.frequency_penalty,
-            params.presence_penalty,
-            penalty_range,
-            max(
-                repetition_decay, 1
-            ),  # TODO: Allow decay = 0 when exl3 kernel fix is pushed (v0.0.27)
+        # Build the sampler stack. Greedy if temperature is 0
+        sampler_builder = ExllamaV3SamplerBuilder.from_params(
+            params, self.tokenizer, self.max_seq_len
         )
-
-        # Ban tokens
-        if params.banned_tokens:
-            sampler_builder.ban_tokens(params.banned_tokens)
-
-        # Apply temperature first to builder
-        if not params.temperature_last:
-            sampler_builder.temperature(params.temperature)
-
-        # Apply alphabet samplers to builder
-        sampler_builder.top_k(params.top_k)
-        sampler_builder.top_p(params.top_p)
-        sampler_builder.min_p(params.min_p)
-
-        # Apply temperature last to builder
-        if params.temperature_last:
-            sampler_builder.temperature(params.temperature)
-
-        # Apply XTC to the final distribution
-        if params.xtc_probability > 0.0:
-            sampler_builder.xtc(params.xtc_probability, params.xtc_threshold, self.tokenizer)
-
-        # Apply adaptive-P
-        if params.adaptive_target < 1.0:
-            sampler_builder.adaptive_p(params.adaptive_target, params.adaptive_decay)
-
-        # Build the sampler
-        # Set greedy if temperature is 0
         sampler = sampler_builder.build(params.temperature == 0)
+        settings = list(sampler_builder.settings)
 
         # Dynamically scale penalty range to output tokens
         # Only do this if freq/pres pen is enabled
@@ -1398,7 +1351,7 @@ class ExllamaV3Container:
         # Log prompt to console. Add the BOS token if specified
         log_prompt(
             f"{self.tokenizer.bos_token if add_bos_token else ''}{prompt}",
-            request_id,
+            label,
         )
 
         if params.json_schema or params.regex_pattern or params.grammar_string:
@@ -1426,6 +1379,43 @@ class ExllamaV3Container:
                 grammar_handler.add_grammar_filter(
                     params.grammar_string, self.tokenizer, trigger_token_id=trigger_token_id
                 )
+
+        # Generation controls, listed after the sampler settings
+        if params.max_tokens:
+            settings.append(("max_tokens", max_tokens))
+        else:
+            settings.append(("max_tokens", (max_tokens, "auto")))
+        if params.min_tokens:
+            settings.append(("min_tokens", params.min_tokens))
+        # Templates add their own stop strings; only report the client's
+        if params.stop and params.param_source("stop") != "default":
+            settings.append(("stop", f"{len(params.stop)} sequences"))
+        if params.banned_strings:
+            settings.append(("banned_strings", f"{len(params.banned_strings)} strings"))
+        if params.json_schema:
+            settings.append(("json_schema", True))
+        if params.regex_pattern:
+            settings.append(("regex_pattern", True))
+        if params.grammar_string:
+            settings.append(("grammar_string", True))
+        if params.token_healing:
+            settings.append(("token_healing", True))
+        if params.logprobs or params.top_logprobs:
+            settings.append(("logprobs", max(params.logprobs or 0, params.top_logprobs or 0)))
+        if params.param_source("loop_detect_window") != "default":
+            settings.append(("loop_detect_window", params.loop_detect_window))
+
+        settings_text = format_settings(settings, params)
+        log_request_start(
+            label,
+            context_len,
+            settings_text,
+            {
+                "request_id": request_id,
+                "prompt_tokens": context_len,
+                "settings": {name: str(value) for name, value in settings},
+            },
+        )
 
         generation = {}
         job = AsyncJob(
@@ -1523,7 +1513,9 @@ class ExllamaV3Container:
 
                 if result.get("eos"):
                     xlogger.debug("EOS result received from generator", result)
-                    finish_chunk = self.handle_finish_chunk(result, request_id, full_response)
+                    finish_chunk = self.handle_finish_chunk(
+                        result, request_id, full_response, label
+                    )
                     await disconnect_handler.finish(id(job))
 
                     # Save the final result for metrics logging
@@ -1559,6 +1551,7 @@ class ExllamaV3Container:
             # Log generation options to console
             # Some options are too large, so log the args instead
             log_generation_params(
+                label,
                 request_id=request_id,
                 bos_token_id=self.tokenizer.bos_token_id,
                 eos_token_id=eos_tokens,
@@ -1570,7 +1563,7 @@ class ExllamaV3Container:
             # Log the metrics if present
             if metrics_result:
                 log_metrics(
-                    request_id,
+                    label,
                     metrics_result,
                     context_len,
                     self.max_seq_len,

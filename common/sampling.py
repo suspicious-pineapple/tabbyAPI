@@ -300,6 +300,24 @@ class BaseSamplerRequest(BaseModel):
         ge=0,
     )
 
+    def param_source(self, name: str) -> str:
+        """
+        Where the effective value of a sampler param came from: "req" (sent with the
+        request), "forced" or "preset" (sampler override preset), or "default".
+        """
+
+        override = overrides_container.overrides.get(name)
+        if isinstance(override, dict) and override.get("override") and override.get("force"):
+            return "forced"
+
+        if name in self.model_fields_set:
+            return "req"
+
+        if isinstance(override, dict) and override.get("override") is not None:
+            return "preset"
+
+        return "default"
+
     def get_stop_on_loop(self) -> tuple[int, int] | None:
         """Get ExLlamaV3 loop detection parameters."""
 
