@@ -12,7 +12,6 @@ from collections.abc import Mapping, Sequence, Set
 
 from loguru import logger
 from rich.console import Console
-from rich.markup import escape
 from rich.progress import (
     BarColumn,
     MofNCompleteColumn,
@@ -21,8 +20,7 @@ from rich.progress import (
     TextColumn,
     TimeRemainingColumn,
 )
-
-from common.utils import unwrap
+from rich.text import Text
 
 _w = os.getenv("TABBY_LOG_CONSOLE_WIDTH")
 _default_console_width = int(_w) if _w is not None and _w.isnumeric() else None
@@ -50,44 +48,58 @@ def get_loading_progress_bar():
     )
 
 
-def _log_formatter(record: dict):
-    """Log message formatter."""
+_LEVEL_STYLES = {
+    "TRACE": "dim blue",
+    "DEBUG": "cyan",
+    "INFO": "green",
+    "SUCCESS": "bold green",
+    "WARNING": "yellow",
+    "ERROR": "red",
+    "CRITICAL": "bold white on red",
+}
 
-    color_map = {
-        "TRACE": "dim blue",
-        "DEBUG": "cyan",
-        "INFO": "green",
-        "SUCCESS": "bold green",
-        "WARNING": "yellow",
-        "ERROR": "red",
-        "CRITICAL": "bold white on red",
-    }
+# Width of the "LEVEL:" column, so messages line up across levels
+_LEVEL_WIDTH = 9
 
-    time = record.get("time")
-    colored_time = f"[grey37]{time:YYYY-MM-DD HH:mm:ss.SSS}[/grey37]"
 
-    level = record.get("level")
-    level_color = color_map.get(level.name, "cyan")
-    colored_level = f"[{level_color}]{level.name}[/{level_color}]:"
+def render_log_record(record: dict, message: str, console: Console) -> Text:
+    """
+    Lay out one log record with the timestamp and level on the left and the
+    message wrapped to the console width on the right. Continuation lines are
+    indented to the message column, so a long or multi-line message stays
+    aligned instead of running back under the timestamp.
+    """
 
-    separator = " " * (9 - len(level.name))
+    # The file log keeps the full date; the console only needs the time of day
+    time = record["time"]
+    level = record["level"].name
 
-    message = unwrap(record.get("message"), "")
+    out = Text(no_wrap=True)
+    out.append(f"{time:%H:%M:%S}.{time.microsecond // 1000:03d} ", style="grey37")
+    out.append(f"{level}:", style=_LEVEL_STYLES.get(level, "cyan"))
+    out.append(" " * (_LEVEL_WIDTH - len(level)))
 
-    # Replace once loguru allows for turning off str.format
-    message = message.replace("{", "{{").replace("}", "}}").replace("<", r"\<")
+    indent = out.cell_len
+    width = max(console.width - indent, 20)
 
-    # Escape markup tags from Rich
-    message = escape(message)
-    lines = message.splitlines()
+    # Printing a plain string would run the console's highlighter (numbers,
+    # paths, URLs); do the same for the Text we build here
+    body = console.highlighter(Text(message.rstrip("\n")))
+    lines = body.wrap(console, width)
 
-    fmt = ""
-    if len(lines) > 1:
-        fmt = "\n".join([f"{colored_time} {colored_level}{separator}{line}" for line in lines])
-    else:
-        fmt = f"{colored_time} {colored_level}{separator}{message}"
+    for index, line in enumerate(lines):
+        if index:
+            out.append("\n" + " " * indent)
+        line.rstrip()
+        out.append_text(line)
 
-    return fmt
+    return out
+
+
+def _console_sink(message):
+    """Loguru sink that prints records through the rich console."""
+
+    RICH_CONSOLE.print(render_log_record(message.record, str(message), RICH_CONSOLE))
 
 
 # Uvicorn log handler
@@ -116,10 +128,9 @@ def setup_logger():
     logger.remove()
 
     logger.add(
-        RICH_CONSOLE.print,
+        _console_sink,
         level=LOG_LEVEL,
-        format=_log_formatter,
-        colorize=True,
+        format="{message}",
     )
     # Add file logging
     logger.add(
@@ -203,11 +214,9 @@ class XLogger:
             )
             r.raise_for_status()
         except requests.RequestException as e:
-            logger.info(
-                f"Failed to initialize seqlog handler for server at "
-                f"{self.seqlog_url}: {e}"
-                f"seqlog logging is disabled."
-            )
+            reason = e.__class__.__name__
+            logger.warning(f"Seq logging disabled: could not reach {self.seqlog_url} ({reason})")
+            logger.debug(f"Seq probe error: {e}")
             return
 
         self.enabled = True
