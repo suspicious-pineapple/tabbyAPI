@@ -48,6 +48,29 @@ async def entrypoint_async():
 
             port = fallback_port
 
+    # Set sampler parameter overrides if provided. Do this before the model
+    # load so a bad preset name fails fast instead of after a long load
+    sampling_override_preset = config.sampling.override_preset
+    if sampling_override_preset:
+        try:
+            await sampling.overrides_from_file(sampling_override_preset)
+        except FileNotFoundError as e:
+            logger.error(
+                f"{e}\n"
+                "Fix `override_preset` in the sampling section of your config "
+                "(available presets: "
+                + (", ".join(sampling.get_all_presets()) or "none")
+                + "). Exiting."
+            )
+            raise SystemExit(1) from None
+    else:
+        logger.warning(
+            "No sampler override preset is configured (sampling.override_preset), so "
+            "sampling parameters have no fallback values. Requests that omit them run "
+            "untruncated: temperature 1.0, top_k 0, top_p 1.0, min_p 0. "
+            "Set override_preset to safe_defaults unless this is intentional."
+        )
+
     # If an initial model name is specified, create a container
     # and load the model
     model_name = config.model.model_name

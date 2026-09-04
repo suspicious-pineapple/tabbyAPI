@@ -556,9 +556,10 @@ class SamplingConfig(BaseConfigModel):
             "Find this in the sampler-overrides folder.\n"
             "This overrides default fallbacks for sampler values "
             "that are passed to the API.\n"
-            "NOTE: safe_defaults preset provides a fallback for frontends "
-            "that do not pass sampling params.\n"
-            "Remove it if not necessary."
+            "NOTE: safe_defaults provides llama.cpp-style fallbacks (temperature 0.8, "
+            "top_k 40, top_p 0.95, min_p 0.05)\n"
+            "for frontends that don't send sampling parameters. Leaving this blank "
+            "means no fallbacks at all."
         ),
     )
 
