@@ -117,6 +117,14 @@ class LoggingConfig(BaseConfigModel):
             "Enable request logging (default: False).\nNOTE: Only use this for debugging!"
         ),
     )
+    log_live_status: Optional[bool] = Field(
+        True,
+        description=(
+            "Show a live status line below the log with cache usage and in-flight "
+            "jobs (default: True).\n"
+            "Only shown on an interactive terminal."
+        ),
+    )
     log_chat_completion_requests: Optional[bool] = Field(
         False,
         description=(

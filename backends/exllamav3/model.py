@@ -44,6 +44,7 @@ from common.multimodal import MultimodalEmbeddingWrapper
 from common.networking import DisconnectHandler
 from common.optional_dependencies import check_package_version
 from common.sampling import BaseSamplerRequest
+from common.status_display import status_display
 from common.tabby_config import config
 from common.templating import PromptTemplate, find_prompt_template
 from common.transformers_utils import HFModel
@@ -1437,6 +1438,7 @@ class ExllamaV3Container:
         )
         self.active_job_ids[request_id] = job
         await disconnect_handler.add_cleanup_task(id(job), job.cancel, ())
+        job_status = status_display.add_job(request_id, label, context_len)
 
         generated_tokens = 0
         full_response = ""
@@ -1446,6 +1448,12 @@ class ExllamaV3Container:
         try:
             async for result in job:
                 await disconnect_handler.poll()
+
+                stage = result.get("stage")
+                if stage == "started":
+                    job_status.started(result.get("cached_tokens", 0))
+                elif stage == "prefill":
+                    job_status.prefill(result.get("curr_progress", 0))
 
                 # The generator can produce several results per iteration
                 # (speculative decoding), while this consumer may only get one
@@ -1509,6 +1517,7 @@ class ExllamaV3Container:
                     if params.logprobs > 0:
                         self.handle_logprobs(result, generation)
 
+                    job_status.generated(generated_tokens)
                     yield generation
 
                 if result.get("eos"):
@@ -1548,6 +1557,8 @@ class ExllamaV3Container:
 
             raise ex
         finally:
+            status_display.remove_job(request_id)
+
             # Log generation options to console
             # Some options are too large, so log the args instead
             log_generation_params(

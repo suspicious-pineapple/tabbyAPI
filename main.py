@@ -19,6 +19,7 @@ from common.logger import setup_logger, xlogger
 from common.networking import is_port_in_use
 from common.optional_dependencies import dependencies
 from common.signals import signal_handler
+from common.status_display import status_display
 from common.tabby_config import config
 
 
@@ -109,15 +110,13 @@ async def entrypoint_async():
 
     gen_logging.broadcast_status()
 
-    # Set sampler parameter overrides if provided
-    sampling_override_preset = config.sampling.override_preset
-    if sampling_override_preset:
-        try:
-            await sampling.overrides_from_file(sampling_override_preset)
-        except FileNotFoundError as e:
-            logger.warning(str(e))
+    if config.logging.log_live_status:
+        status_display.start()
 
-    await start_api(host, port)
+    try:
+        await start_api(host, port)
+    finally:
+        await status_display.stop()
 
     # Uvicorn has finished serving; unload any loaded models so pending
     # jobs are cancelled and the generator is closed cleanly
