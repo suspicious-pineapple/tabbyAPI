@@ -52,7 +52,7 @@ def format_settings(settings: list, params: BaseSamplerRequest) -> str:
 def log_request_start(label: str, context_len: int, settings_text: str, extra: dict):
     """One-line summary of a generation request as the backend starts it."""
 
-    xlogger.info(f"{label}: {context_len:,} prompt tokens | {settings_text}", extra)
+    xlogger.info(f"{label}: {context_len:,} prompt tokens · {settings_text}", extra)
 
 
 def log_generation_params(label: str, **kwargs):
@@ -177,7 +177,7 @@ def log_metrics(
     if finish:
         sections.append(finish)
 
-    message = f"{label}: " + " | ".join(sections)
+    message = f"{label}: " + " · ".join(sections)
     if context_len and context_len > max_seq_len:
         message += " (context truncated)"
 

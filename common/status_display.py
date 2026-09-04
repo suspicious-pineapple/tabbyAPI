@@ -157,8 +157,12 @@ class StatusDisplay:
             line.append(f"{used:,}/{max_tokens:,} tokens in use")
             line.append(f" ({used / max_tokens * 100:.0f}%)", style="dim")
             line.append(f" · {stats['cached_tokens']:,} reusable")
+            if stats.get("tier_max_tokens"):
+                line.append(f" + {stats['tier_cached_tokens']:,} in sysmem")
             if stats["hit_rate"] is not None:
                 line.append(f" · hit rate {stats['hit_rate'] * 100:.0f}%")
+                if stats.get("tier_max_tokens") and stats.get("tier_hit_rate") is not None:
+                    line.append(f" incl. {stats['tier_hit_rate'] * 100:.0f}% from sysmem")
             line.append(" · ")
             queued = stats["pending_jobs"]
 
