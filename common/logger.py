@@ -44,6 +44,9 @@ def get_loading_progress_bar():
         MofNCompleteColumn(),
         TimeRemainingColumn(),
         console=RICH_CONSOLE,
+        # Bars disappear once loading is done on a terminal; a plain log keeps
+        # the final state as a single line instead
+        transient=RICH_CONSOLE.is_terminal,
     )
 
 
