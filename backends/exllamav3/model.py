@@ -27,7 +27,7 @@ from backends.exllamav3.grammar import ExLlamaV3Grammar
 
 from backends.exllamav3.sampler import ExllamaV3SamplerBuilder
 from backends.exllamav3.utils import exllama_supports_nccl
-from backends.exllamav3.vision import clear_image_embedding_cache
+from backends.exllamav3.vision import clear_image_embedding_cache, image_embedding_cache
 from common.concurrency import iterate_in_threadpool
 from common.gen_logging import (
     format_settings,
@@ -227,6 +227,7 @@ class ExllamaV3Container:
                 self.vision_model = Model.from_config(self.config, component="vision")
                 if self.config.infer_params.vision_pinned:
                     xlogger.info("Keeping vision model weights in system RAM (vision_offload).")
+                image_embedding_cache.configure(config.memory.sysmem_multimodal_cache)
             else:
                 xlogger.warning(
                     "The provided model does not have vision capabilities that are "

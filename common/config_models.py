@@ -645,6 +645,17 @@ class MemoryConfig(BaseConfigModel):
         0,
         description=("Size of system memory second-tier K/V cache, in MB (default: 0)"),
     )
+    sysmem_multimodal_cache: Optional[int] = Field(
+        1024,
+        description=(
+            "Size of the image embedding cache in system memory, in MB (default: 1024).\n"
+            "Encoded images are kept so repeated turns of a conversation don't re-run\n"
+            "the vision model. Images already in use by a request are never evicted;\n"
+            "a context whose images exceed the budget is cached only partially, with\n"
+            "a warning. Only applies when vision is enabled."
+        ),
+        ge=0,
+    )
     cuda_malloc_async: Optional[bool] = Field(
         True,
         description=(

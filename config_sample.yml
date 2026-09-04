@@ -360,6 +360,12 @@ memory:
   # Size of system memory second-tier K/V cache, in MB (default: 0)
   sysmem_kv_cache: 0
 
+  # Size of the image embedding cache in system memory, in MB (default: 1024).
+  # Encoded images are kept so repeated turns of a conversation don't re-run the vision model.
+  # Images already in use by a request are never evicted; a context whose images exceed the
+  # budget is cached only partially, with a warning. Only applies when vision is enabled.
+  sysmem_multimodal_cache: 1024
+
   # Use cudaMallocAsync backend in Torch (default: True).
   # Enabling this is generally preferable, but it may cause issues with certain
   # workloads. Try disabling it if you experience intermittent OoM errors. If
