@@ -61,8 +61,18 @@ _LEVEL_STYLES = {
 # Width of the "LEVEL:" column, so messages line up across levels
 _LEVEL_WIDTH = 9
 
+# Whether console lines carry a time-of-day prefix; set from config at startup
+console_timestamps = True
 
-def render_log_record(record: dict, message: str, console: Console) -> Text:
+
+def set_console_timestamps(enabled: bool):
+    global console_timestamps
+    console_timestamps = bool(enabled)
+
+
+def render_log_record(
+    record: dict, message: str, console: Console, timestamps: bool = True
+) -> Text:
     """
     Lay out one log record with the timestamp and level on the left and the
     message wrapped to the console width on the right. Continuation lines are
@@ -75,7 +85,8 @@ def render_log_record(record: dict, message: str, console: Console) -> Text:
     level = record["level"].name
 
     out = Text(no_wrap=True)
-    out.append(f"{time:%H:%M:%S}.{time.microsecond // 1000:03d} ", style="grey37")
+    if timestamps:
+        out.append(f"{time:%H:%M:%S}.{time.microsecond // 1000:03d} ", style="grey37")
     out.append(f"{level}:", style=_LEVEL_STYLES.get(level, "cyan"))
     out.append(" " * (_LEVEL_WIDTH - len(level)))
 
@@ -99,7 +110,9 @@ def render_log_record(record: dict, message: str, console: Console) -> Text:
 def _console_sink(message):
     """Loguru sink that prints records through the rich console."""
 
-    RICH_CONSOLE.print(render_log_record(message.record, str(message), RICH_CONSOLE))
+    RICH_CONSOLE.print(
+        render_log_record(message.record, str(message), RICH_CONSOLE, console_timestamps)
+    )
 
 
 # Uvicorn log handler

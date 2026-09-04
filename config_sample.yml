@@ -56,6 +56,10 @@ logging:
   # Only shown on an interactive terminal.
   log_live_status: true
 
+  # Prefix console log lines with the time of day (default: True).
+  # The log files under logs/ always carry full timestamps.
+  log_timestamps: true
+
   # Write every /v1/chat/completions request to logs/debug/ as JSON (default: False).
   # Also saves the fully templated prompt (the exact text sent to the tokenizer)
   # as a .txt file with the same basename.

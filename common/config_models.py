@@ -125,6 +125,13 @@ class LoggingConfig(BaseConfigModel):
             "Only shown on an interactive terminal."
         ),
     )
+    log_timestamps: Optional[bool] = Field(
+        True,
+        description=(
+            "Prefix console log lines with the time of day (default: True).\n"
+            "The log files under logs/ always carry full timestamps."
+        ),
+    )
     log_chat_completion_requests: Optional[bool] = Field(
         False,
         description=(
