@@ -178,7 +178,7 @@ class ExllamaV3Container:
         self = cls()
 
         # Make sure ExllamaV3 is up to date
-        check_package_version("exllamav3", "1.4.6")
+        check_package_version("exllamav3", "1.4.7")
 
         self.model_dir = model_directory
         self.hf_model = hf_model

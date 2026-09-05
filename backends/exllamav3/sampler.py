@@ -17,13 +17,15 @@ from exllamav3.generator.sampler import (
     SS_BanTokens,
     SS_XTC,
     SS_LogitBias,
+    SS_DRY,
+    dry_sequence_breaker_tokens,
 )
 
 # Logits-space steps that remain meaningful under greedy decoding: they can
 # change which token has the highest logit, unlike the probability-shaping
 # steps (temperature, top-k/p, min-p, XTC), which never alter the argmax
 _GREEDY_KEPT_STEPS = tuple(
-    step for step in (SS_LogitBias, SS_RepP, SS_PresFreqP, SS_BanTokens) if step is not None
+    step for step in (SS_LogitBias, SS_RepP, SS_PresFreqP, SS_DRY, SS_BanTokens) if step is not None
 )
 
 
@@ -82,6 +84,31 @@ class ExllamaV3SamplerBuilder:
                 settings.append(("penalty_range", params.penalty_range))
             if params.repetition_decay:
                 settings.append(("repetition_decay", params.repetition_decay))
+
+        # DRY works on the raw logits like the other penalties, so it goes before them
+        # are transformed. An empty breaker list means the backend's default set
+        if params.dry_multiplier > 0 and params.dry_base >= 1.0:
+            breakers = None
+            if params.dry_sequence_breakers:
+                breakers = dry_sequence_breaker_tokens(
+                    tokenizer, tuple(params.dry_sequence_breakers)
+                )
+            builder.dry(
+                params.dry_multiplier,
+                params.dry_base,
+                params.dry_allowed_length,
+                params.dry_range,
+                breakers,
+            )
+            settings.append(("dry_multiplier", params.dry_multiplier))
+            settings.append(("dry_base", params.dry_base))
+            settings.append(("dry_allowed_length", params.dry_allowed_length))
+            if params.dry_range:
+                settings.append(("dry_range", params.dry_range))
+            if params.dry_sequence_breakers:
+                settings.append(
+                    ("dry_sequence_breakers", f"{len(params.dry_sequence_breakers)} strings")
+                )
 
         if params.banned_tokens:
             builder.ban_tokens(params.banned_tokens)
@@ -144,6 +171,17 @@ class ExllamaV3SamplerBuilder:
             SS_RepP(rep_p, penalty_range, rep_decay),
             SS_PresFreqP(pres_p, freq_p, penalty_range, rep_decay),
         ]
+
+    def dry(self, multiplier, base, allowed_length, dry_range, sequence_breakers):
+        self.stack.append(
+            SS_DRY(
+                dry_multiplier=multiplier,
+                dry_base=base,
+                dry_allowed_length=allowed_length,
+                dry_range=dry_range,
+                dry_sequence_breakers=sequence_breakers,
+            )
+        )
 
     def ban_tokens(self, banned_tokens):
         self.stack.append(SS_BanTokens(banned_tokens))
