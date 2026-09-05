@@ -767,5 +767,132 @@ class DeepseekV4ToolcallFormatTests(unittest.TestCase):
         self.assertEqual(calls[0].function.arguments, '{"location": "Tokyo"}')
 
 
+class Lfm2ToolcallFormatTests(unittest.TestCase):
+    """
+    LFM2 / LFM2.5 models emit a Pythonic tool-call list wrapped in
+    <|tool_call_start|> and <|tool_call_end|> sentinels, e.g.
+        <|tool_call_start|>[browser_navigate(url='/home/user1/workspace')]<|tool_call_end|>
+    The parser turns each function call in the list into a ToolCall with
+    JSON-encoded keyword arguments.
+    """
+
+    def parse(self, text):
+        from endpoints.OAI.utils.toolcall_formats.lfm2 import parse_toolcalls
+
+        return parse_toolcalls(text)
+
+    def test_single_call(self):
+        calls = self.parse(
+            "<|tool_call_start|>"
+            "[browser_navigate(url='/home/user1/workspace')]"
+            "<|tool_call_end|>"
+        )
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0].function.name, "browser_navigate")
+        self.assertEqual(
+            calls[0].function.arguments, '{"url": "/home/user1/workspace"}'
+        )
+
+    def test_parallel_calls(self):
+        calls = self.parse(
+            "<|tool_call_start|>"
+            '[f(a=1), g(b="x")]'
+            "<|tool_call_end|>"
+        )
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(calls[0].function.name, "f")
+        self.assertEqual(calls[0].function.arguments, '{"a": 1}')
+        self.assertEqual(calls[1].function.name, "g")
+        self.assertEqual(calls[1].function.arguments, '{"b": "x"}')
+
+    def test_typed_kwargs(self):
+        calls = self.parse(
+            "<|tool_call_start|>"
+            "[f(count=3, ratio=0.5, ok=True, nothing=None, "
+            'items=["x", "y"], obj={"k": 1}, neg=-2)]'
+            "<|tool_call_end|>"
+        )
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(
+            calls[0].function.arguments,
+            '{"count": 3, "ratio": 0.5, "ok": true, "nothing": null, '
+            '"items": ["x", "y"], "obj": {"k": 1}, "neg": -2}',
+        )
+
+    def test_nested_quotes(self):
+        # Single-quoted value containing an escaped double quote and a colon
+        calls = self.parse(
+            "<|tool_call_start|>"
+            '[f(command="echo \\"hi\\"")]'
+            "<|tool_call_end|>"
+        )
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(
+            calls[0].function.arguments, r'{"command": "echo \"hi\""}'
+        )
+
+    def test_no_args(self):
+        calls = self.parse("<|tool_call_start|>[list_files()]<|tool_call_end|>")
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0].function.name, "list_files")
+        self.assertEqual(calls[0].function.arguments, "{}")
+
+    def test_empty_list_no_calls(self):
+        calls = self.parse("<|tool_call_start|>[]<|tool_call_end|>")
+        self.assertEqual(len(calls), 0)
+
+    def test_parses_without_sentinels(self):
+        # No sentinels present — treat the whole text as the call list
+        calls = self.parse("[f(a=1)]")
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0].function.name, "f")
+        self.assertEqual(calls[0].function.arguments, '{"a": 1}')
+
+    def test_plain_prose_returns_nothing(self):
+        calls = self.parse("No tool calls here. The weather is nice.")
+        self.assertEqual(len(calls), 0)
+
+    def test_malformed_returns_nothing(self):
+        calls = self.parse("<|tool_call_start|>greetings, world<|tool_call_end|>")
+        self.assertEqual(len(calls), 0)
+
+    def test_reserved_keyword_param(self):
+        # A tool parameter named after a Python keyword cannot be parsed as
+        # a literal; it must be rewritten and restored.
+        calls = self.parse("<|tool_call_start|>[f(from='x')]<|tool_call_end|>")
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0].function.name, "f")
+        self.assertEqual(calls[0].function.arguments, '{"from": "x"}')
+
+    def test_streamed_through_tag_parser(self):
+        from endpoints.OAI.utils.toolcall_formats.lfm2 import (
+            TOOLCALL_START,
+            TOOLCALL_END,
+        )
+
+        p = TagStreamParser(
+            reasoning_start="<|thinking|>",
+            reasoning_end="</thinking>",
+            tool_start=TOOLCALL_START,
+            tool_end=TOOLCALL_END,
+            start_in_reasoning=True,
+        )
+        text = (
+            "pondering</thinking>Let me check."
+            "<|tool_call_start|>"
+            "[get_weather(location='Tokyo')]"
+            "<|tool_call_end|>"
+        )
+        # Feed in small chunks to exercise tag holdback
+        out = collect(p, [text[i : i + 7] for i in range(0, len(text), 7)])
+        self.assertEqual(out["reasoning"], "pondering")
+        self.assertEqual(out["content"], "Let me check.")
+
+        calls = self.parse(out["tool"])
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0].function.name, "get_weather")
+        self.assertEqual(calls[0].function.arguments, '{"location": "Tokyo"}')
+
+
 if __name__ == "__main__":
     unittest.main()
