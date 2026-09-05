@@ -1,10 +1,19 @@
-# Minimal "safe" fallback settings for most models, used when the frontend doesn't supply any settings
-# with a request.
+# Fallback sampling settings for frontends that don't send any. These match the
+# llama.cpp defaults so a bare request behaves the way most users expect.
+# Each value only applies when the request omits that parameter (force: false).
 
 temperature:
   override: 0.8
   force: false
 
+top_k:
+  override: 40
+  force: false
+
 top_p:
-  override: 0.9
+  override: 0.95
+  force: false
+
+min_p:
+  override: 0.05
   force: false

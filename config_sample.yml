@@ -36,6 +36,10 @@ network:
   # connections from dropping during long prefills. Set to 0 to disable.
   sse_ping_interval: 15
 
+  # Log every HTTP request with client address, method, path and status (default: False).
+  # Generation requests are already logged in detail; this adds the rest, such as model list and health polls.
+  access_log: false
+
 # Options for logging
 logging:
   # Enable prompt logging (default: False).
@@ -47,6 +51,14 @@ logging:
   # Enable request logging (default: False).
   # NOTE: Only use this for debugging!
   log_requests: false
+
+  # Show a live status line below the log with cache usage and in-flight jobs (default: True).
+  # Only shown on an interactive terminal.
+  log_live_status: true
+
+  # Prefix console log lines with the time of day (default: True).
+  # The log files under logs/ always carry full timestamps.
+  log_timestamps: true
 
   # Write every /v1/chat/completions request to logs/debug/ as JSON (default: False).
   # Also saves the fully templated prompt (the exact text sent to the tokenizer)
@@ -313,7 +325,7 @@ sampling:
   # Find this in the sampler-overrides folder.
   # This overrides default fallbacks for sampler values that are passed to the API.
   # NOTE: safe_defaults is noob friendly and provides fallbacks for frontends that don't send sampling parameters.
-  # Remove this for any advanced usage.
+  # for frontends that don't send sampling parameters. Leaving this blank means no fallbacks at all.
   override_preset: safe_defaults
 
 # Options for Loras
@@ -351,6 +363,12 @@ memory:
 
   # Size of system memory second-tier K/V cache, in MB (default: 0)
   sysmem_kv_cache: 0
+
+  # Size of the image embedding cache in system memory, in MB (default: 1024).
+  # Encoded images are kept so repeated turns of a conversation don't re-run the vision model.
+  # Images already in use by a request are never evicted; a context whose images exceed the
+  # budget is cached only partially, with a warning. Only applies when vision is enabled.
+  sysmem_multimodal_cache: 1024
 
   # Use cudaMallocAsync backend in Torch (default: True).
   # Enabling this is generally preferable, but it may cause issues with certain

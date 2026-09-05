@@ -14,6 +14,7 @@ from common.model import check_embeddings_container, check_model_container
 from common.networking import (
     get_sse_ping_interval,
     handle_request_error,
+    request_tag,
     DisconnectHandler,
     run_with_request_disconnect,
 )
@@ -87,7 +88,7 @@ async def completion_request(request: Request, data: CompletionRequest) -> Compl
         data.json_schema = data.response_format.json_schema
 
     try:
-        disconnect_handler = DisconnectHandler(request, "/v1/completions")
+        disconnect_handler = DisconnectHandler(request, f"{request_tag(request)} completions")
         await disconnect_handler.poll()
 
         if data.stream and not config.developer.disable_request_streaming:
@@ -149,7 +150,7 @@ async def chat_completion_request(
         data.json_schema = data.response_format.json_schema
 
     try:
-        disconnect_handler = DisconnectHandler(request, "/v1/chat/completions")
+        disconnect_handler = DisconnectHandler(request, f"{request_tag(request)} chat/completions")
         await disconnect_handler.poll()
 
         if data.stream and not config.developer.disable_request_streaming:
@@ -180,7 +181,7 @@ async def embeddings(request: Request, data: EmbeddingsRequest) -> EmbeddingsRes
     response = await run_with_request_disconnect(
         request,
         embeddings_task,
-        f"Embeddings request {request.state.id} cancelled",
+        f"{request_tag(request)} embeddings cancelled by client",
     )
 
     return response

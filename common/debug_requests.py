@@ -9,6 +9,7 @@ import aiofiles
 from fastapi import Request
 
 from common.logger import xlogger
+from common.networking import request_tag
 from common.tabby_config import config
 
 
@@ -97,7 +98,7 @@ async def write_chat_completion_request_log(request: Request, body: dict) -> Pat
         )
         return None
 
-    xlogger.info(f"Wrote chat completion request debug log: {log_path}")
+    xlogger.info(f"{request_tag(request)}: wrote request debug log {log_path}")
     return log_path
 
 

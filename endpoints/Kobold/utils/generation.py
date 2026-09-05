@@ -12,6 +12,7 @@ from common.networking import (
     handle_request_disconnect,
     handle_request_error,
     request_disconnect_loop,
+    request_tag,
 )
 from common.utils import unwrap
 from endpoints.Kobold.types.generation import (
@@ -52,13 +53,14 @@ async def _stream_collector(data: GenerateRequest, request: Request):
     generation_cache[data.genkey] = {"abort": abort_event, "text": ""}
 
     try:
-        logger.info(f"Received Kobold generation request {data.genkey}")
+        logger.debug(f"Received Kobold generation request {data.genkey}")
 
         generator = model.container.stream_generate(
             request_id=data.genkey,
             prompt=data.prompt,
             params=data,
             abort_event=abort_event,
+            label=f"{request_tag(request)} kobold/generate",
         )
 
         async for generation in generator:
@@ -75,13 +77,13 @@ async def _stream_collector(data: GenerateRequest, request: Request):
                 yield text
 
             if "finish_reason" in generation:
-                logger.info(f"Finished streaming Kobold request {data.genkey}")
+                logger.debug(f"Finished streaming Kobold request {data.genkey}")
                 break
     except CancelledError:
         # If the request disconnects, break out
         if not abort_event.is_set():
             abort_event.set()
-            handle_request_disconnect(f"Kobold generation {data.genkey} cancelled by user.")
+            handle_request_disconnect(f"{request_tag(request)} kobold/generate cancelled by user.")
     finally:
         # Cleanup the cache
         del generation_cache[data.genkey]
@@ -102,7 +104,7 @@ async def stream_generation(data: GenerateRequest, request: Request):
         yield get_context_length_generator_error(str(exc))
     except Exception:
         yield get_generator_error(
-            f"Kobold generation {data.genkey} aborted. Please check the server console."
+            f"{request_tag(request)} kobold/generate aborted. Please check the server console."
         )
 
 
@@ -125,7 +127,7 @@ async def get_generation(data: GenerateRequest, request: Request):
         raise ContextLengthHTTPException(error_message) from exc
     except Exception as exc:
         error_message = handle_request_error(
-            f"Completion {request.state.id} aborted. Maybe the model was unloaded? "
+            f"{request_tag(request)} kobold/generate aborted. Maybe the model was unloaded? "
             "Please check the server console."
         ).error.message
 

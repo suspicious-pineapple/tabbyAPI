@@ -11,6 +11,7 @@ import base64
 from fastapi import Request
 import numpy as np
 from common.logger import xlogger
+from common.networking import request_tag
 
 from common import model
 from endpoints.OAI.types.embedding import (
@@ -38,7 +39,7 @@ def float_list_to_base64(float_array: np.ndarray) -> str:
 async def get_embeddings(data: EmbeddingsRequest, request: Request) -> dict:
     model_path = model.embeddings_container.model_dir
 
-    xlogger.info(f"Received embeddings request {request.state.id}")
+    xlogger.debug(f"Received embeddings request {request.state.id}")
 
     if not isinstance(data.input, list):
         data.input = [data.input]
@@ -63,6 +64,9 @@ async def get_embeddings(data: EmbeddingsRequest, request: Request) -> dict:
         usage=UsageInfo(prompt_tokens=usage, total_tokens=usage),
     )
 
-    xlogger.info(f"Finished embeddings request {request.state.id}")
+    xlogger.info(
+        f"{request_tag(request)} embeddings: {len(data.input)} inputs, {usage} tokens",
+        {"request_id": request.state.id, "inputs": len(data.input), "tokens": usage},
+    )
 
     return response

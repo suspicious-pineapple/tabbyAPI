@@ -30,7 +30,6 @@ UNSUPPORTED_PARAMS = {
     "tfs": 1.0,
     "typical": 1.0,
     "skew": 0.0,
-    "dry_multiplier": 0.0,
     "mirostat_mode": 0,
     "temp_exponent": 1.0,
 }
@@ -181,25 +180,49 @@ class BaseSamplerRequest(BaseModel):
     )
 
     dry_multiplier: Optional[float] = Field(
-        default_factory=lambda: get_default_sampler_value("dry_multiplier", 0.0)
+        default_factory=lambda: get_default_sampler_value("dry_multiplier", 0.0),
+        description="DRY repetition penalty scale. 0 disables DRY.",
+        examples=[0.8],
+        ge=0,
     )
 
     dry_base: Optional[float] = Field(
-        default_factory=lambda: get_default_sampler_value("dry_base", 0.0)
+        default_factory=lambda: get_default_sampler_value("dry_base", 1.75),
+        description="Base of the exponential DRY penalty growth per repeated token.",
+        examples=[1.75],
+        ge=0,
     )
 
     dry_allowed_length: Optional[int] = Field(
-        default_factory=lambda: get_default_sampler_value("dry_allowed_length", 0)
+        default_factory=lambda: get_default_sampler_value("dry_allowed_length", 2),
+        description="Longest repeated sequence DRY leaves unpenalized.",
+        examples=[2],
+        ge=0,
     )
 
     dry_range: Optional[int] = Field(
         default_factory=lambda: get_default_sampler_value("dry_range", 0),
-        validation_alias=AliasChoices("dry_range", "dry_penalty_last_n"),
-        description=("Aliases: dry_penalty_last_n"),
+        description="Number of recent tokens DRY scans. 0 means the whole context.",
+        examples=[0],
+    )
+
+    dry_penalty_last_n: Optional[int] = Field(
+        None,
+        description=(
+            "llama.cpp-style DRY window: -1 scans the whole context, 0 disables DRY, "
+            "a positive value scans that many recent tokens. Takes precedence over dry_range."
+        ),
+        examples=[-1],
     )
 
     dry_sequence_breakers: Optional[Union[str, List[str]]] = Field(
-        default_factory=lambda: get_default_sampler_value("dry_sequence_breakers", [])
+        default_factory=lambda: get_default_sampler_value("dry_sequence_breakers", []),
+        description=(
+            "Strings that repeated sequences cannot span; every token containing one "
+            "of them is a breaker. An empty list uses the backend's default set "
+            "(punctuation, brackets, quotes, newlines and special tokens)."
+        ),
+        examples=[["\n", ":", '"', "*"]],
     )
 
     mirostat_mode: Optional[int] = Field(
@@ -300,6 +323,24 @@ class BaseSamplerRequest(BaseModel):
         ge=0,
     )
 
+    def param_source(self, name: str) -> str:
+        """
+        Where the effective value of a sampler param came from: "req" (sent with the
+        request), "forced" or "preset" (sampler override preset), or "default".
+        """
+
+        override = overrides_container.overrides.get(name)
+        if isinstance(override, dict) and override.get("override") and override.get("force"):
+            return "forced"
+
+        if name in self.model_fields_set:
+            return "req"
+
+        if isinstance(override, dict) and override.get("override") is not None:
+            return "preset"
+
+        return "default"
+
     def get_stop_on_loop(self) -> tuple[int, int] | None:
         """Get ExLlamaV3 loop detection parameters."""
 
@@ -366,6 +407,14 @@ class BaseSamplerRequest(BaseModel):
         if self.min_tokens and self.max_tokens and self.min_tokens > self.max_tokens:
             raise ValidationError("min tokens cannot be more then max tokens")
 
+        # llama.cpp's window parameter uses 0 for "off" where dry_range uses 0
+        # for "whole context", so it maps onto dry_range explicitly
+        if self.dry_penalty_last_n is not None:
+            if self.dry_penalty_last_n == 0:
+                self.dry_multiplier = 0.0
+            else:
+                self.dry_range = max(self.dry_penalty_last_n, 0)
+
         self.warn_unsupported_params()
 
         return self
@@ -412,28 +461,70 @@ def overrides_from_dict(new_overrides: dict):
         raise TypeError("New sampler overrides must be a dict!")
 
 
+def resolve_preset_path(preset_name: str) -> Optional[pathlib.Path]:
+    """
+    Locate a sampler override preset in the sampler_overrides folder.
+
+    The name is accepted with or without its .yml/.yaml extension, so both
+    "my_preset" and "my_preset.yml" find the same file.
+    """
+
+    override_directory = pathlib.Path("sampler_overrides")
+    name = preset_name.strip()
+
+    candidates = [override_directory / name]
+    if not name.lower().endswith((".yml", ".yaml")):
+        candidates += [override_directory / f"{name}.yml", override_directory / f"{name}.yaml"]
+
+    for candidate in candidates:
+        if candidate.is_file():
+            return candidate
+
+    return None
+
+
+def describe_overrides(overrides: dict) -> str:
+    """One-line summary of a set of sampler overrides, e.g. "temperature 0.8, top_k 40"."""
+
+    parts = []
+    for key, value in overrides.items():
+        if not isinstance(value, dict) or "override" not in value:
+            continue
+
+        item = f"{key} {value['override']}"
+        if value.get("force"):
+            item += " (forced)"
+        elif value.get("additive"):
+            item += " (additive)"
+        parts.append(item)
+
+    return ", ".join(parts) if parts else "no overrides"
+
+
 async def overrides_from_file(preset_name: str):
     """Fetches an override preset from a file"""
 
-    preset_path = pathlib.Path(f"sampler_overrides/{preset_name}.yml")
-    if preset_path.exists():
-        overrides_container.selected_preset = preset_path.stem
-        async with aiofiles.open(preset_path, "r", encoding="utf8") as raw_preset:
-            contents = await raw_preset.read()
-
-            # Create a temporary YAML parser
-            yaml = YAML(typ="safe")
-            preset = yaml.load(contents)
-            overrides_from_dict(preset)
-
-            xlogger.info("Applied sampler overrides from file.", {"preset": preset})
-    else:
-        error_message = (
-            f'Sampler override file named "{preset_name}" was not found. '
-            + "Make sure it's located in the sampler_overrides folder."
+    preset_path = resolve_preset_path(preset_name)
+    if preset_path is None:
+        raise FileNotFoundError(
+            f'Sampler override preset "{preset_name}" was not found in the '
+            "sampler_overrides folder."
         )
 
-        raise FileNotFoundError(error_message)
+    overrides_container.selected_preset = preset_path.stem
+    async with aiofiles.open(preset_path, "r", encoding="utf8") as raw_preset:
+        contents = await raw_preset.read()
+
+        # Create a temporary YAML parser
+        yaml = YAML(typ="safe")
+        preset = yaml.load(contents)
+        overrides_from_dict(preset)
+
+        xlogger.info(
+            f'Sampler preset "{preset_path.stem}": '
+            + describe_overrides(overrides_container.overrides),
+            {"preset": preset},
+        )
 
 
 def get_all_presets():

@@ -81,6 +81,15 @@ class NetworkConfig(BaseConfigModel):
         ),
         ge=0,
     )
+    access_log: Optional[bool] = Field(
+        False,
+        description=(
+            "Log every HTTP request with client address, method, path and status "
+            "(default: False).\n"
+            "Generation requests are already logged in detail; this adds the rest, "
+            "such as model list and health polls."
+        ),
+    )
 
     # Converts all strings in the api_servers list to lowercase
     # NOTE: Expand if more models need this validator
@@ -106,6 +115,21 @@ class LoggingConfig(BaseConfigModel):
         False,
         description=(
             "Enable request logging (default: False).\nNOTE: Only use this for debugging!"
+        ),
+    )
+    log_live_status: Optional[bool] = Field(
+        True,
+        description=(
+            "Show a live status line below the log with cache usage and in-flight "
+            "jobs (default: True).\n"
+            "Only shown on an interactive terminal."
+        ),
+    )
+    log_timestamps: Optional[bool] = Field(
+        True,
+        description=(
+            "Prefix console log lines with the time of day (default: True).\n"
+            "The log files under logs/ always carry full timestamps."
         ),
     )
     log_chat_completion_requests: Optional[bool] = Field(
@@ -556,9 +580,10 @@ class SamplingConfig(BaseConfigModel):
             "Find this in the sampler-overrides folder.\n"
             "This overrides default fallbacks for sampler values "
             "that are passed to the API.\n"
-            "NOTE: safe_defaults preset provides a fallback for frontends "
-            "that do not pass sampling params.\n"
-            "Remove it if not necessary."
+            "NOTE: safe_defaults provides llama.cpp-style fallbacks (temperature 0.8, "
+            "top_k 40, top_p 0.95, min_p 0.05)\n"
+            "for frontends that don't send sampling parameters. Leaving this blank "
+            "means no fallbacks at all."
         ),
     )
 
@@ -626,6 +651,17 @@ class MemoryConfig(BaseConfigModel):
     sysmem_kv_cache: Optional[int] = Field(
         0,
         description=("Size of system memory second-tier K/V cache, in MB (default: 0)"),
+    )
+    sysmem_multimodal_cache: Optional[int] = Field(
+        1024,
+        description=(
+            "Size of the image embedding cache in system memory, in MB (default: 1024).\n"
+            "Encoded images are kept so repeated turns of a conversation don't re-run\n"
+            "the vision model. Images already in use by a request are never evicted;\n"
+            "a context whose images exceed the budget is cached only partially, with\n"
+            "a warning. Only applies when vision is enabled."
+        ),
+        ge=0,
     )
     cuda_malloc_async: Optional[bool] = Field(
         True,

@@ -1,0 +1,211 @@
+"""
+Live console status line: cache usage and in-flight generation jobs.
+
+Rendered with rich's Live display below the regular log output, so log lines
+keep scrolling above it. Only active on an interactive terminal.
+"""
+
+import asyncio
+import time
+from collections import deque
+from dataclasses import dataclass, field
+from typing import Optional
+
+from rich.console import Group
+from rich.progress_bar import ProgressBar
+from rich.rule import Rule
+from rich.table import Table
+from rich.text import Text
+
+from common.logger import RICH_CONSOLE
+
+REFRESH_INTERVAL = 0.25
+SPEED_WINDOW = 2.0
+
+
+@dataclass
+class JobStatus:
+    """Progress of one generation job, updated from generator events."""
+
+    label: str
+    prompt_tokens: int
+    stage: str = "queued"
+    cached_tokens: int = 0
+    prefill_tokens: int = 0
+    gen_tokens: int = 0
+    created: float = field(default_factory=time.monotonic)
+    samples: deque = field(default_factory=deque)
+
+    def started(self, cached_tokens: int):
+        self.stage = "prefill"
+        self.cached_tokens = cached_tokens
+        self.prefill_tokens = cached_tokens
+
+    def prefill(self, progress: int):
+        self.stage = "prefill"
+        self.prefill_tokens = max(self.prefill_tokens, progress)
+
+    def generated(self, gen_tokens: int):
+        self.stage = "generating"
+        self.prefill_tokens = self.prompt_tokens
+        self.gen_tokens = gen_tokens
+
+        now = time.monotonic()
+        self.samples.append((now, gen_tokens))
+        while self.samples and now - self.samples[0][0] > SPEED_WINDOW:
+            self.samples.popleft()
+
+    def tokens_per_second(self) -> Optional[float]:
+        if len(self.samples) < 2:
+            return None
+
+        (t0, n0), (t1, n1) = self.samples[0], self.samples[-1]
+        return (n1 - n0) / (t1 - t0) if t1 > t0 else None
+
+
+class StatusDisplay:
+    def __init__(self):
+        self.jobs: dict[str, JobStatus] = {}
+        self.completed = 0
+        self._live = None
+        self._task: Optional[asyncio.Task] = None
+
+    @property
+    def active(self) -> bool:
+        return self._live is not None
+
+    def start(self):
+        """Show the status line. No-op when the console isn't a terminal."""
+
+        if self._live is not None or not RICH_CONSOLE.is_terminal:
+            return
+
+        # Deferred import: rich.live pulls in a fair amount at import time
+        from rich.live import Live
+
+        self._live = Live(
+            self.render(),
+            console=RICH_CONSOLE,
+            auto_refresh=False,
+            transient=True,
+        )
+        self._live.start()
+        self._task = asyncio.create_task(self._refresh_loop())
+
+    async def stop(self):
+        if self._task is not None:
+            self._task.cancel()
+            self._task = None
+
+        if self._live is not None:
+            self._live.stop()
+            self._live = None
+
+    async def _refresh_loop(self):
+        # Refreshing from the event loop keeps every read of job state on the
+        # same thread that writes it
+        while True:
+            await asyncio.sleep(REFRESH_INTERVAL)
+            try:
+                self._live.update(self.render(), refresh=True)
+            except Exception:
+                pass
+
+    # Job tracking, called from the generation loop
+
+    def add_job(self, request_id: str, label: str, prompt_tokens: int) -> JobStatus:
+        status = JobStatus(label=label, prompt_tokens=prompt_tokens)
+        self.jobs[request_id] = status
+        return status
+
+    def remove_job(self, request_id: str):
+        if self.jobs.pop(request_id, None) is not None:
+            self.completed += 1
+
+    # Rendering
+
+    @staticmethod
+    def _cache_stats() -> Optional[dict]:
+        """Cache statistics from the backend, or None when it doesn't provide them."""
+
+        from common import model
+
+        container = model.container
+        generator = getattr(getattr(container, "generator", None), "generator", None)
+        if generator is None or not hasattr(generator, "get_cache_stats"):
+            return None
+
+        try:
+            return generator.get_cache_stats()
+        except Exception:
+            return None
+
+    def _summary_line(self) -> Text:
+        from common import model
+
+        line = Text()
+        if not (model.container and model.container.loaded):
+            line.append("No model loaded", style="dim")
+            return line
+
+        stats = self._cache_stats()
+        queued = 0
+        if stats:
+            max_tokens = stats["max_tokens"]
+            used = stats["used_tokens"]
+            line.append("cache ", style="bold")
+            line.append(f"{used:,}/{max_tokens:,} tokens in use")
+            line.append(f" ({used / max_tokens * 100:.0f}%)", style="dim")
+            line.append(f" · {stats['cached_tokens']:,} reusable")
+            if stats.get("tier_max_tokens"):
+                line.append(f" + {stats['tier_cached_tokens']:,} in sysmem")
+            if stats["hit_rate"] is not None:
+                line.append(f" · hit rate {stats['hit_rate'] * 100:.0f}%")
+                if stats.get("tier_max_tokens") and stats.get("tier_hit_rate") is not None:
+                    line.append(f" incl. {stats['tier_hit_rate'] * 100:.0f}% from sysmem")
+            line.append(" · ")
+            queued = stats["pending_jobs"]
+
+        line.append(f"{len(self.jobs)} active")
+        if queued:
+            line.append(f", {queued} queued")
+
+        total_tps = sum(j.tokens_per_second() or 0 for j in self.jobs.values())
+        if total_tps:
+            line.append(f" · {total_tps:,.0f} T/s")
+
+        return line
+
+    def _job_row(self, job: JobStatus):
+        label = Text(job.label, style="cyan")
+
+        if job.stage == "queued":
+            return label, Text("queued", style="dim"), Text(""), Text("")
+
+        if job.stage == "prefill":
+            bar = ProgressBar(
+                total=max(job.prompt_tokens, 1), completed=job.prefill_tokens, width=24
+            )
+            detail = Text(f"{job.prefill_tokens:,}/{job.prompt_tokens:,} tokens")
+            if job.cached_tokens:
+                detail.append(f" ({job.cached_tokens:,} cached)", style="dim")
+            return label, Text("prefill"), bar, detail
+
+        detail = Text(f"{job.gen_tokens:,} tokens")
+        tps = job.tokens_per_second()
+        if tps is not None:
+            detail.append(f" · {tps:,.1f} T/s")
+        return label, Text("generating"), Text(""), detail
+
+    def render(self):
+        table = Table.grid(padding=(0, 2))
+        for _ in range(4):
+            table.add_column(no_wrap=True)
+
+        for job in list(self.jobs.values()):
+            table.add_row(*self._job_row(job))
+
+        return Group(Rule(style="dim"), self._summary_line(), table)
+
+
+status_display = StatusDisplay()
