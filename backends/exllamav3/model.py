@@ -2,6 +2,7 @@ import asyncio
 import gc
 import pathlib
 import re
+import time
 from asyncio import CancelledError
 
 import torch
@@ -28,12 +29,14 @@ from backends.exllamav3.grammar import ExLlamaV3Grammar
 
 from backends.exllamav3.sampler import ExllamaV3SamplerBuilder
 from backends.exllamav3.utils import exllama_supports_nccl
-from backends.exllamav3.vision import clear_image_embedding_cache
+from backends.exllamav3.vision import clear_image_embedding_cache, image_embedding_cache
 from common.concurrency import iterate_in_threadpool
 from common.gen_logging import (
+    format_settings,
     log_generation_params,
     log_metrics,
     log_prompt,
+    log_request_start,
 )
 from common.hardware import hardware_supports_exllamav3
 from common.health import HealthManager
@@ -43,10 +46,11 @@ from common.multimodal import MultimodalEmbeddingWrapper
 from common.networking import DisconnectHandler
 from common.optional_dependencies import check_package_version
 from common.sampling import BaseSamplerRequest
+from common.status_display import status_display
 from common.tabby_config import config
 from common.templating import PromptTemplate, find_prompt_template
 from common.transformers_utils import HFModel
-from common.utils import coalesce, unwrap
+from common.utils import unwrap
 from endpoints.OAI.types.chat_completion import ChatCompletionLogprob, ChatCompletionLogprobLeaf
 from endpoints.core.types.model import ModelCard, ModelCardParameters
 from endpoints.OAI.utils.tools import is_supported_format
@@ -179,7 +183,7 @@ class ExllamaV3Container:
         self = cls()
 
         # Make sure ExllamaV3 is up to date
-        check_package_version("exllamav3", "1.4.4")
+        check_package_version("exllamav3", "1.4.7")
 
         self.model_dir = model_directory
         self.hf_model = hf_model
@@ -228,6 +232,7 @@ class ExllamaV3Container:
                 self.vision_model = Model.from_config(self.config, component="vision")
                 if self.config.infer_params.vision_pinned:
                     xlogger.info("Keeping vision model weights in system RAM (vision_offload).")
+                image_embedding_cache.configure(config.memory.sysmem_multimodal_cache)
             else:
                 xlogger.warning(
                     "The provided model does not have vision capabilities that are "
@@ -357,22 +362,22 @@ class ExllamaV3Container:
         max_seq_len_default = 8192
 
         if max_seq_len_model and not max_seq_len_user:
-            xlogger.info(f"Using default max_seq_len from model: {max_seq_len_model} tokens.")
+            max_seq_len_source = "model default"
             max_seq_len = max_seq_len_model
         elif max_seq_len_user:
-            xlogger.info(f"Using configured max_seq_len: {max_seq_len_user} tokens.")
+            max_seq_len_source = "configured"
             max_seq_len = max_seq_len_user
         else:
             xlogger.warning(
                 f"max_seq_len is undefined. Defaulting to {max_seq_len_default} tokens."
             )
             max_seq_len = max_seq_len_default
+            max_seq_len_source = "fallback"
 
         cache_size_user = kwargs.get("cache_size")
         cache_size_default = max_seq_len
 
         if cache_size_user:
-            xlogger.info(f"Using configured cache_size: {cache_size_user} tokens.")
             cache_size = cache_size_user
         else:
             xlogger.warning(
@@ -390,6 +395,11 @@ class ExllamaV3Container:
 
         self.max_seq_len = max_seq_len
         self.cache_size = cache_size
+
+        xlogger.info(
+            f"Context: max_seq_len {max_seq_len:,} tokens ({max_seq_len_source}), "
+            f"cache_size {cache_size:,} tokens"
+        )
 
         # Max batch size
         default_mbs = 4 if self.model.caps.get("recurrent_states") else 128
@@ -570,6 +580,24 @@ class ExllamaV3Container:
 
         return chunk_size
 
+    def job_max_rq_tokens(self, max_tokens: int) -> Optional[int]:
+        """
+        Output chunk size for a job, or None to allocate the whole completion up front.
+
+        ExLlamaV3 reserves cache pages for prompt + max_rq_tokens per round, aligned up
+        to a page (or recurrent checkpoint) boundary, regardless of max_new_tokens. A
+        completion that fits inside a single chunk never requeues, so chunking it would
+        only over-reserve pages and reduce concurrency. Reserve exactly what it needs.
+        """
+
+        if self.max_rq_tokens is None or max_tokens <= 0:
+            return self.max_rq_tokens
+
+        if max_tokens <= self.max_rq_tokens:
+            return None
+
+        return self.max_rq_tokens
+
     def create_cache(self, raw_cache_mode: str, model: Model):
         # Cast exl2 types to exl3
         match raw_cache_mode:
@@ -744,6 +772,7 @@ class ExllamaV3Container:
             # Wait for existing generation jobs to finish
             await self.wait_for_jobs(kwargs.get("skip_wait"))
 
+            load_start = time.perf_counter()
             generator = self.load_model_sync(progress_callback)
             async for value in iterate_in_threadpool(generator):
                 yield value
@@ -758,8 +787,7 @@ class ExllamaV3Container:
 
             # Cleanup and update model load state
             self.loaded = True
-            xlogger.info("Model successfully loaded.")
-            self.init_qlora()
+            xlogger.info(f"Model loaded in {time.perf_counter() - load_start:.1f} s")
         finally:
             self.load_lock.release()
 
@@ -786,14 +814,14 @@ class ExllamaV3Container:
                 if value:
                     yield value
 
-        xlogger.info("Loading model: " + str(self.model_dir))
-
         if self.use_tp:
-            xlogger.info("Loading with tensor parallel")
+            split_mode = "tensor parallel"
         elif self.gpu_split_auto:
-            xlogger.info("Loading with autosplit")
+            split_mode = "autosplit"
         else:
-            xlogger.info("Loading with a manual GPU split (or a one GPU setup)")
+            split_mode = "manual GPU split"
+
+        xlogger.info(f"Loading model {self.model_dir} ({split_mode})")
 
         for value in self.model.load_gen(
             tensor_p=self.use_tp,
@@ -987,6 +1015,10 @@ class ExllamaV3Container:
                 embeddings=mm_embeddings,
             )
         )
+        max_tokens = unwrap(params.max_tokens, 0)
+        if max_tokens <= 0:
+            max_tokens = self.max_seq_len - context_len - 1
+
         generator = self.generator.generator
         allocation_boundary = (
             generator.recurrent_checkpoint_interval
@@ -996,9 +1028,9 @@ class ExllamaV3Container:
         validate_context_requirements(
             context_len,
             self.max_seq_len,
-            unwrap(params.max_tokens, 0),
+            max_tokens,
             self.cache.max_num_tokens,
-            self.max_rq_tokens,
+            self.job_max_rq_tokens(max_tokens),
             allocation_boundary,
         )
 
@@ -1077,6 +1109,7 @@ class ExllamaV3Container:
         disconnect_handler: DisconnectHandler = None,
         mm_embeddings: Optional[MultimodalEmbeddingWrapper] = None,
         filter_trigger: str = None,
+        label: Optional[str] = None,
     ) -> AsyncIterator[Dict[str, Any]]:
         """
         Generates a response iteratively (streaming) for a given prompt.
@@ -1089,6 +1122,7 @@ class ExllamaV3Container:
             mm_embeddings: Optional multimodal embeddings.
             filter_trigger: Delay filters (from params) until trigger text.
                 Must map to single token.
+            label: Short name for the request in console logs.
 
         Yields:
             Generation chunks
@@ -1117,6 +1151,7 @@ class ExllamaV3Container:
                 disconnect_handler=disconnect_handler,
                 mm_embeddings=mm_embeddings,
                 filter_trigger=filter_trigger,
+                label=label,
             ):
                 yield generation_chunk
         finally:
@@ -1204,8 +1239,11 @@ class ExllamaV3Container:
 
         generation["logprobs_content"] = content
 
-    def handle_finish_chunk(self, result: dict, request_id: str, full_text: str):
+    def handle_finish_chunk(
+        self, result: dict, request_id: str, full_text: str, label: Optional[str] = None
+    ):
         eos_reason = result.get("eos_reason")
+        label = label or f"request {request_id}"
 
         stop_str = None
         if eos_reason == "max_new_tokens":
@@ -1219,7 +1257,7 @@ class ExllamaV3Container:
                 stop_str = result.get("eos_triggering_string")
             elif eos_reason == "loop_detected":
                 xlogger.warning(
-                    f"Generation stopped because a token loop was detected, ID: {request_id}",
+                    f"{label}: generation stopped because a token loop was detected",
                     {
                         "request_id": request_id,
                         "eos_reason": eos_reason,
@@ -1288,6 +1326,7 @@ class ExllamaV3Container:
         disconnect_handler: DisconnectHandler = None,
         mm_embeddings: Optional[MultimodalEmbeddingWrapper] = None,
         filter_trigger: str = None,
+        label: Optional[str] = None,
     ):
         """
         Create generator function for prompt completion.
@@ -1295,77 +1334,19 @@ class ExllamaV3Container:
         for kwargs, check common/sampling.py
         """
         chunk_tokens: torch.Tensor | tuple[torch.Tensor, torch.Tensor]
+        label = label or f"request {request_id}"
 
         xlogger.debug(
             f"Starting generation, ID: {request_id}",
             {"request_id": request_id, "params": params.model_dump(mode="json")},
         )
 
-        sampler_builder = ExllamaV3SamplerBuilder()
-
-        # Apply logit bias first so it lands ahead of the other steps
-        if params.logit_bias:
-            sampler_builder.logit_bias(params.logit_bias)
-
-        # Penalties
-
-        # Set penalty range
-        penalty_range = unwrap(params.penalty_range, self.max_seq_len)
-
-        # Exl3's version of including the entire context
-        if penalty_range < 0:
-            penalty_range = int(10e7)
-
-        # Always make sure the fallback is 0 if range < 0
-        # It's technically fine to use -1, but this just validates the passed
-        # fallback
-        # Always default to 0 if something goes wrong
-        if params.penalty_range < 0:
-            fallback_decay = 0
-        else:
-            fallback_decay = params.penalty_range
-
-        repetition_decay = coalesce(params.repetition_decay, fallback_decay, 0)
-
-        # Apply penalties to builder
-        sampler_builder.penalties(
-            params.repetition_penalty,
-            params.frequency_penalty,
-            params.presence_penalty,
-            penalty_range,
-            max(
-                repetition_decay, 1
-            ),  # TODO: Allow decay = 0 when exl3 kernel fix is pushed (v0.0.27)
+        # Build the sampler stack. Greedy if temperature is 0
+        sampler_builder = ExllamaV3SamplerBuilder.from_params(
+            params, self.tokenizer, self.max_seq_len
         )
-
-        # Ban tokens
-        if params.banned_tokens:
-            sampler_builder.ban_tokens(params.banned_tokens)
-
-        # Apply temperature first to builder
-        if not params.temperature_last:
-            sampler_builder.temperature(params.temperature)
-
-        # Apply alphabet samplers to builder
-        sampler_builder.top_k(params.top_k)
-        sampler_builder.top_p(params.top_p)
-        sampler_builder.min_p(params.min_p)
-
-        # Apply temperature last to builder
-        if params.temperature_last:
-            sampler_builder.temperature(params.temperature)
-
-        # Apply XTC to the final distribution
-        if params.xtc_probability > 0.0:
-            sampler_builder.xtc(params.xtc_probability, params.xtc_threshold, self.tokenizer)
-
-        # Apply adaptive-P
-        if params.adaptive_target < 1.0:
-            sampler_builder.adaptive_p(params.adaptive_target, params.adaptive_decay)
-
-        # Build the sampler
-        # Set greedy if temperature is 0
         sampler = sampler_builder.build(params.temperature == 0)
+        settings = list(sampler_builder.settings)
 
         # Dynamically scale penalty range to output tokens
         # Only do this if freq/pres pen is enabled
@@ -1413,6 +1394,7 @@ class ExllamaV3Container:
             max_tokens = self.max_seq_len - context_len - 1
 
         # Validate the initial job before the generator's page-allocation assertion
+        max_rq_tokens = self.job_max_rq_tokens(max_tokens)
         generator = self.generator.generator
         allocation_boundary = (
             generator.recurrent_checkpoint_interval
@@ -1424,14 +1406,14 @@ class ExllamaV3Container:
             self.max_seq_len,
             max_tokens,
             self.cache.max_num_tokens,
-            self.max_rq_tokens,
+            max_rq_tokens,
             allocation_boundary,
         )
 
         # Log prompt to console. Add the BOS token if specified
         log_prompt(
             f"{self.tokenizer.bos_token if add_bos_token else ''}{prompt}",
-            request_id,
+            label,
         )
 
         if params.json_schema or params.regex_pattern or params.grammar_string:
@@ -1460,6 +1442,43 @@ class ExllamaV3Container:
                     params.grammar_string, self.tokenizer, trigger_token_id=trigger_token_id
                 )
 
+        # Generation controls, listed after the sampler settings
+        if params.max_tokens:
+            settings.append(("max_tokens", max_tokens))
+        else:
+            settings.append(("max_tokens", (max_tokens, "auto")))
+        if params.min_tokens:
+            settings.append(("min_tokens", params.min_tokens))
+        # Templates add their own stop strings; only report the client's
+        if params.stop and params.param_source("stop") != "default":
+            settings.append(("stop", f"{len(params.stop)} sequences"))
+        if params.banned_strings:
+            settings.append(("banned_strings", f"{len(params.banned_strings)} strings"))
+        if params.json_schema:
+            settings.append(("json_schema", True))
+        if params.regex_pattern:
+            settings.append(("regex_pattern", True))
+        if params.grammar_string:
+            settings.append(("grammar_string", True))
+        if params.token_healing:
+            settings.append(("token_healing", True))
+        if params.logprobs or params.top_logprobs:
+            settings.append(("logprobs", max(params.logprobs or 0, params.top_logprobs or 0)))
+        if params.param_source("loop_detect_window") != "default":
+            settings.append(("loop_detect_window", params.loop_detect_window))
+
+        settings_text = format_settings(settings, params)
+        log_request_start(
+            label,
+            context_len,
+            settings_text,
+            {
+                "request_id": request_id,
+                "prompt_tokens": context_len,
+                "settings": {name: str(value) for name, value in settings},
+            },
+        )
+
         generation = {}
         job = AsyncJob(
             self.generator,
@@ -1474,12 +1493,13 @@ class ExllamaV3Container:
             embeddings=mm_embeddings_content,
             return_top_tokens=params.top_logprobs,
             return_probs=bool(params.logprobs) or bool(params.top_logprobs),
-            max_rq_tokens=self.max_rq_tokens,
+            max_rq_tokens=max_rq_tokens,
             stop_on_loop=params.get_stop_on_loop(),
             filters=grammar_handler.filters,
         )
         self.active_job_ids[request_id] = job
         await disconnect_handler.add_cleanup_task(id(job), job.cancel, ())
+        job_status = status_display.add_job(request_id, label, context_len)
 
         generated_tokens = 0
         full_response = ""
@@ -1489,6 +1509,12 @@ class ExllamaV3Container:
         try:
             async for result in job:
                 await disconnect_handler.poll()
+
+                stage = result.get("stage")
+                if stage == "started":
+                    job_status.started(result.get("cached_tokens", 0))
+                elif stage == "prefill":
+                    job_status.prefill(result.get("curr_progress", 0))
 
                 # The generator can produce several results per iteration
                 # (speculative decoding), while this consumer may only get one
@@ -1515,7 +1541,9 @@ class ExllamaV3Container:
 
                 chunk = unwrap(result.get("text"), "")
                 if chunk:
-                    chunk_tokens = result.get("token_ids", self.tokenizer.encode(chunk))
+                    chunk_tokens = result.get("token_ids")
+                    if chunk_tokens is None:
+                        chunk_tokens = self.tokenizer.encode(chunk)
                     full_response += chunk
 
                     # Extract token IDs as a plain list for downstream consumers
@@ -1550,11 +1578,14 @@ class ExllamaV3Container:
                     if params.logprobs > 0:
                         self.handle_logprobs(result, generation)
 
+                    job_status.generated(generated_tokens)
                     yield generation
 
                 if result.get("eos"):
                     xlogger.debug("EOS result received from generator", result)
-                    finish_chunk = self.handle_finish_chunk(result, request_id, full_response)
+                    finish_chunk = self.handle_finish_chunk(
+                        result, request_id, full_response, label
+                    )
                     await disconnect_handler.finish(id(job))
 
                     # Save the final result for metrics logging
@@ -1587,9 +1618,12 @@ class ExllamaV3Container:
 
             raise ex
         finally:
+            status_display.remove_job(request_id)
+
             # Log generation options to console
             # Some options are too large, so log the args instead
             log_generation_params(
+                label,
                 request_id=request_id,
                 bos_token_id=self.tokenizer.bos_token_id,
                 eos_token_id=eos_tokens,
@@ -1601,7 +1635,7 @@ class ExllamaV3Container:
             # Log the metrics if present
             if metrics_result:
                 log_metrics(
-                    request_id,
+                    label,
                     metrics_result,
                     context_len,
                     self.max_seq_len,

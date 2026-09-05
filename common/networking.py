@@ -1,9 +1,9 @@
 """Common utility functions"""
 
 import asyncio
+import itertools
 import json
 import socket
-import time
 import traceback
 from fastapi import Depends, HTTPException, Request
 from loguru import logger
@@ -79,6 +79,16 @@ def handle_request_disconnect(message: str):
 
 
 class DisconnectHandler:
+    """
+    Tracks whether the client of a request has gone away.
+
+    A background task owns the request's ASGI receive channel and flags the
+    handler as soon as an ``http.disconnect`` message arrives, so ``poll()``
+    is a plain flag check that never suspends the caller. This keeps the
+    per-token consumer loop cheap and lets it run in lockstep with the
+    generator instead of yielding to it while the request status is queried.
+    """
+
     def __init__(
         self,
         request: Request,
@@ -86,39 +96,55 @@ class DisconnectHandler:
     ):
         self.request = request
         self.abort_event = asyncio.Event()
-        self.last_poll = time.time() - 10
         self.disconnected = False
         self.cleanup_tasks = {}
         self.description = description
 
+        self._reported = False
+        self._watcher = asyncio.create_task(self._watch())
+
+    async def _watch(self):
+        """Wait for the client to disconnect and flag it."""
+
+        try:
+            # The request body has already been consumed at this point, so the
+            # only messages left on the channel are stray http.request events
+            # (which are ignored) and the eventual http.disconnect. Uvicorn also
+            # sends http.disconnect once the response completes, so this task
+            # always terminates on its own even if cleanup() is never called.
+            while True:
+                message = await self.request.receive()
+                if message["type"] == "http.disconnect":
+                    break
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.warning(f"Disconnect watcher for {self.description} stopped: {exc}")
+            return
+
+        self.disconnected = True
+        self.abort_event.set()
+
     async def poll(self):
         """
-        Poll the request status a maximum of 20 times per second. Once request is disconnected
-        runs scheduled cleanup tasks and raises asyncio.CancelledError. Caller is responsible for
-        forwarding the error back to the endpoint function. The endpoint fn should call poll() at
-        least once before returning a non-canceled response
+        Check whether the request has disconnected. This does not suspend the caller. Once the
+        request is disconnected, runs scheduled cleanup tasks and raises asyncio.CancelledError.
+        Caller is responsible for forwarding the error back to the endpoint function. The endpoint
+        fn should call poll() at least once before returning a non-canceled response.
         """
 
-        now = time.time()
-        if now < self.last_poll + 0.05:
+        if not self.disconnected:
             return
-        self.last_poll = now
 
-        # Check if request has disconnected
-        if await self.request.is_disconnected():
-            # Set abort signal
-            if self.abort_event is not None:
-                self.abort_event.set()
+        # Trigger any cleanup tasks
+        await self.cleanup()
 
-            # Trigger any cleanup tasks
-            await self.cleanup()
+        # Log and raise
+        if not self._reported:
+            xlogger.warning(f"{self.description}: client disconnected, generation cancelled")
+            self._reported = True
 
-            # Log and raise
-            if not self.disconnected:
-                xlogger.error(f"Request disconnected: {self.description}")
-                self.disconnected = True
-
-            raise asyncio.CancelledError(f"Request disconnected: {self.description}")
+        raise asyncio.CancelledError(f"{self.description}: client disconnected")
 
     async def add_cleanup_task(self, key, func, args):
         # Intentionally strict
@@ -131,6 +157,7 @@ class DisconnectHandler:
 
     # Safe to call redundantly, each cleanup task must be called exactly once
     async def cleanup(self):
+        self._watcher.cancel()
         for func, args in self.cleanup_tasks.values():
             await func(*args)
         self.cleanup_tasks = {}
@@ -178,17 +205,29 @@ def is_port_in_use(port: int) -> bool:
         return test_socket.connect_ex(("localhost", port)) == 0
 
 
+# Short per-process serial for console log lines; the UUID stays the API-facing id
+_request_serials = itertools.count(1)
+
+
 async def add_request_id(request: Request):
-    """FastAPI depends to add a UUID to a request's state."""
+    """FastAPI depends to add a UUID and a console serial to a request's state."""
 
     request.state.id = uuid4().hex
+    request.state.serial = next(_request_serials)
     return request
+
+
+def request_tag(request: Request) -> str:
+    """Short tag identifying a request in console logs, e.g. "#12"."""
+
+    serial = getattr(request.state, "serial", None)
+    return f"#{serial}" if serial is not None else f"#{request.state.id[:8]}"
 
 
 async def log_request(request: Request):
     """FastAPI depends to log a request to the user."""
 
-    log_message = [f"Information for {request.method} request {request.state.id}:"]
+    log_message = [f"{request_tag(request)} {request.method} request (ID {request.state.id}):"]
 
     log_message.append(f"URL: {request.url}")
     log_message.append(f"Headers: {dict(request.headers)}")

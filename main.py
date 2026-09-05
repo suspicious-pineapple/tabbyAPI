@@ -15,10 +15,11 @@ from common import gen_logging, sampling
 from common.args import convert_args_to_dict, init_argparser
 from common.auth import load_auth_keys
 from common.actions import run_subcommand
-from common.logger import setup_logger, xlogger
+from common.logger import set_console_timestamps, setup_logger, xlogger
 from common.networking import is_port_in_use
 from common.optional_dependencies import dependencies
 from common.signals import signal_handler
+from common.status_display import status_display
 from common.tabby_config import config
 
 
@@ -47,6 +48,29 @@ async def entrypoint_async():
             logger.warning(f"Port {port} is currently in use. Switching to {fallback_port}.")
 
             port = fallback_port
+
+    # Set sampler parameter overrides if provided. Do this before the model
+    # load so a bad preset name fails fast instead of after a long load
+    sampling_override_preset = config.sampling.override_preset
+    if sampling_override_preset:
+        try:
+            await sampling.overrides_from_file(sampling_override_preset)
+        except FileNotFoundError as e:
+            logger.error(
+                f"{e}\n"
+                "Fix `override_preset` in the sampling section of your config "
+                "(available presets: "
+                + (", ".join(sampling.get_all_presets()) or "none")
+                + "). Exiting."
+            )
+            raise SystemExit(1) from None
+    else:
+        logger.warning(
+            "No sampler override preset is configured (sampling.override_preset), so "
+            "sampling parameters have no fallback values. Requests that omit them run "
+            "untruncated: temperature 1.0, top_k 0, top_p 1.0, min_p 0. "
+            "Set override_preset to safe_defaults unless this is intentional."
+        )
 
     # If an initial model name is specified, create a container
     # and load the model
@@ -86,15 +110,13 @@ async def entrypoint_async():
 
     gen_logging.broadcast_status()
 
-    # Set sampler parameter overrides if provided
-    sampling_override_preset = config.sampling.override_preset
-    if sampling_override_preset:
-        try:
-            await sampling.overrides_from_file(sampling_override_preset)
-        except FileNotFoundError as e:
-            logger.warning(str(e))
+    if config.logging.log_live_status:
+        status_display.start()
 
-    await start_api(host, port)
+    try:
+        await start_api(host, port)
+    finally:
+        await status_display.stop()
 
     # Uvicorn has finished serving; unload any loaded models so pending
     # jobs are cancelled and the generator is closed cleanly
@@ -132,6 +154,7 @@ def entrypoint(
 
     # load config
     config.load(dict_args)
+    set_console_timestamps(config.logging.log_timestamps)
 
     # optionally enable seqlog logging
     if config.developer.seqlog:

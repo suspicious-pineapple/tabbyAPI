@@ -20,6 +20,7 @@ from common.networking import (
     get_context_length_generator_error,
     get_generator_error,
     handle_request_error,
+    request_tag,
     DisconnectHandler,
 )
 from endpoints.OAI.types.chat_completion import ChatCompletionLogprobs
@@ -31,6 +32,16 @@ from endpoints.OAI.types.completion import (
 )
 from endpoints.OAI.types.common import UsageStats
 from endpoints.OAI.utils.common_ import aggregate_usage_stats, get_usage_stats
+
+
+def _gen_label(request: Request, endpoint: str, n: int, task_idx: int, stream: bool) -> str:
+    """Console label for one generation of a request, e.g. "#12.1 chat/completions (stream)"."""
+
+    tag = request_tag(request)
+    if n > 1:
+        tag = f"{tag}.{task_idx}"
+
+    return f"{tag} {endpoint}" + (" (stream)" if stream else "")
 
 
 def _parse_gen_request_id(n: int, request_id: str, task_idx: int):
@@ -170,6 +181,7 @@ async def _stream_collector(
     params: CompletionRequest,
     streaming_mode: bool = True,
     disconnect_handler: DisconnectHandler = None,
+    label: Optional[str] = None,
 ):
     """
     Starts a request on the backend and collects generations. Only single phase.
@@ -192,6 +204,7 @@ async def _stream_collector(
             params,
             disconnect_handler,
             None,
+            label=label,
         )
         # Initialize with a valid index so a client disconnect before the
         # first token still composes into a valid (empty) choice
@@ -253,9 +266,10 @@ async def stream_generate_completion(
     return_usage = data.stream_options and data.stream_options.include_usage
 
     try:
-        xlogger.info(
-            f"Received completion streaming request {request.state.id}",
+        xlogger.debug(
+            f"{request_tag(request)} completion (stream) payload, ID {request.state.id}",
             {
+                "request_id": request.state.id,
                 "prompts": prompts,
                 "data": data.model_dump(mode="json"),
                 "model_path": str(model_path),
@@ -285,6 +299,7 @@ async def stream_generate_completion(
                         task_gen_params,
                         streaming_mode=True,
                         disconnect_handler=disconnect_handler,
+                        label=_gen_label(request, "completions", total_n, idx, True),
                     )
                 )
                 gen_tasks.append(gen_task)
@@ -328,7 +343,7 @@ async def stream_generate_completion(
 
             # Check if all tasks are completed
             if all(task.done() for task in gen_tasks) and gen_queue.empty():
-                xlogger.info(f"Finished completion streaming request {request.state.id}")
+                xlogger.debug(f"{request_tag(request)} completion stream finished")
                 yield "[DONE]"
                 break
 
@@ -362,9 +377,10 @@ async def generate_completion(
         prompts = [prompts]
 
     try:
-        xlogger.info(
-            f"Received completion request {request.state.id}",
+        xlogger.debug(
+            f"{request_tag(request)} completion payload, ID {request.state.id}",
             {
+                "request_id": request.state.id,
                 "prompts": prompts,
                 "data": data.model_dump(mode="json"),
                 "model_path": str(model_path),
@@ -389,6 +405,7 @@ async def generate_completion(
                         task_gen_params,
                         streaming_mode=False,
                         disconnect_handler=disconnect_handler,
+                        label=_gen_label(request, "completions", total_n, idx, False),
                     )
                 )
                 gen_tasks.append(gen_task)
@@ -404,7 +421,7 @@ async def generate_completion(
             generations.append(r)
         response = _compose_response(request.state.id, generations, model_path.name, return_usage)
 
-        xlogger.info(f"Finished completion request {request.state.id}", {"response": response})
+        xlogger.debug(f"{request_tag(request)} completion finished", {"response": response})
         return response
 
     except CancelledError:
@@ -416,7 +433,7 @@ async def generate_completion(
 
     except Exception as exc:
         error_message = handle_request_error(
-            f"Completion {request.state.id} aborted. Maybe the model was unloaded? "
+            f"{request_tag(request)} completion aborted. Maybe the model was unloaded? "
             "Please check the server console."
         ).error.message
 
