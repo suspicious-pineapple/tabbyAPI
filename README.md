@@ -26,22 +26,12 @@
 >
 > In addition to the README, please read the [Wiki](https://github.com/theroyallab/tabbyAPI/wiki/1.-Getting-Started) page for information about getting started!
 
-> [!NOTE]
-> 
-> ExLlamaV2 models are no longer supported in the `main` branch. The last commit with ExLlamav2 
-> support is preserved on the `exl2-checkpoint` branch.
+> [!WARNING]
+> The ONLY official source for TabbyAPI information is this repository. Any other websites, downloads, or services claiming to represent TabbyAPI are unaffiliated and should be considered as malicious.
 
 > [!NOTE]
 > 
 > Need help? Join the [Discord Server](https://discord.gg/sYQxnuD7Fj) and get the `Tabby` role. Please be nice when asking questions.
-
-> [!NOTE]
-> 
-> Tool calling support has been revamped and now no longer relies on modified Jinja templates. [See the docs for more.](docs/10.-Tool-Calling.md)
-
-> [!NOTE]
-> 
-> Want to run GGUF models? Take a look at [YALS](https://github.com/theroyallab/YALS), TabbyAPI's sister project.
 
 A FastAPI based application that allows for generating text using an LLM (large language model) using the [Exllamav3](https://github.com/turboderp-org/exllamav3) backend.
 
