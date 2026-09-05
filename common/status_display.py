@@ -8,10 +8,11 @@ keep scrolling above it. Only active on an interactive terminal.
 import asyncio
 import time
 from collections import deque
+from io import StringIO
 from dataclasses import dataclass, field
 from typing import Optional
 
-from rich.console import Group
+from rich.console import Console, Group
 from rich.progress_bar import ProgressBar
 from rich.rule import Rule
 from rich.table import Table
@@ -69,6 +70,7 @@ class StatusDisplay:
         self.completed = 0
         self._live = None
         self._task: Optional[asyncio.Task] = None
+        self._last_frame: Optional[str] = None
 
     @property
     def active(self) -> bool:
@@ -103,13 +105,33 @@ class StatusDisplay:
 
     async def _refresh_loop(self):
         # Refreshing from the event loop keeps every read of job state on the
-        # same thread that writes it
+        # same thread that writes it. Frames are only pushed when their content
+        # changed: the Windows console host scrolls the viewport to the cursor
+        # on every write, so an idle display that kept redrawing would make
+        # scrolling back through the log impossible there
         while True:
             await asyncio.sleep(REFRESH_INTERVAL)
             try:
-                self._live.update(self.render(), refresh=True)
+                renderable = self.render()
+                frame = self._frame_text(renderable)
+                if frame != self._last_frame:
+                    self._last_frame = frame
+                    self._live.update(renderable, refresh=True)
             except Exception:
                 pass
+
+    @staticmethod
+    def _frame_text(renderable) -> str:
+        """Plain-text rendering of a frame at the current console width, for change detection."""
+
+        scratch = Console(
+            file=StringIO(),
+            width=RICH_CONSOLE.width,
+            force_terminal=False,
+            color_system=None,
+        )
+        scratch.print(renderable)
+        return scratch.file.getvalue()
 
     # Job tracking, called from the generation loop
 
