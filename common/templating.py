@@ -39,11 +39,16 @@ def _raise_exception(message):
     raise TemplateError(message)
 
 
-def _tojson_compat(value, indent=None, ensure_ascii=True):
+def _tojson_compat(value, indent=None, ensure_ascii=False):
     """Compatibility JSON filter for chat templates.
 
     Some model templates call ``tojson(ensure_ascii=False)`` while the
     bundled Jinja filter may not accept that keyword in sandboxed mode.
+
+    Defaults to ``ensure_ascii=False`` to match transformers: escaping
+    non-ASCII text (e.g. Chinese tool descriptions) into unicode escape
+    sequences silently bloats token counts several-fold and degrades model
+    comprehension.
 
     Returns a plain string, matching the transformers template environment:
     autoescape is off, and a Markup return value would HTML-escape any plain
