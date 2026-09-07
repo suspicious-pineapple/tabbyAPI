@@ -28,6 +28,20 @@ class ModelCardParameters(BaseModel):
     draft: Optional["ModelCard"] = None
 
 
+class ModelCardMeta(BaseModel):
+    """
+    Model metadata in the shape llama-server attaches to /v1/models entries, which
+    local-model clients read to size their context window. Only fields TabbyAPI can
+    determine are included.
+    """
+
+    n_ctx_train: int = Field(0, description="Context length the model was trained with")
+    n_ctx: Optional[int] = Field(None, description="Loaded context length (max_seq_len)")
+    n_vocab: int = 0
+    n_embd: int = 0
+    size: int = Field(0, description="Size of the weight files in bytes (loaded model only)")
+
+
 class ModelCard(BaseModel):
     """Represents a single model card."""
 
@@ -37,6 +51,7 @@ class ModelCard(BaseModel):
     owned_by: str = "tabbyAPI"
     logging: Optional[LoggingConfig] = None
     parameters: Optional[ModelCardParameters] = None
+    meta: Optional[ModelCardMeta] = None
 
 
 class ModelList(BaseModel):
@@ -143,9 +158,20 @@ class ModelDefaultGenerationSettings(BaseModel):
     n_ctx: int
 
 
+class ModelPropsModalities(BaseModel):
+    """Input modalities of the loaded model."""
+
+    vision: bool = False
+
+
 class ModelPropsResponse(BaseModel):
-    """Represents a model props response."""
+    """
+    Represents a model props response, in the shape of llama-server's /props so
+    clients written for it can discover the context size and modalities.
+    """
 
     total_slots: int = 1
+    model_path: str = ""
     chat_template: str = ""
     default_generation_settings: ModelDefaultGenerationSettings
+    modalities: ModelPropsModalities = Field(default_factory=ModelPropsModalities)

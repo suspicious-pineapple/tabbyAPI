@@ -463,11 +463,25 @@ def resolve_template_vars(data: ChatCompletionRequest, container) -> dict:
     }
 
 
+def normalize_message_roles(data: ChatCompletionRequest):
+    """
+    Map the OpenAI "developer" role onto "system". Most chat templates only know
+    system/user/assistant/tool and raise on anything else; the templates that do
+    handle "developer" (Harmony) treat it the same as system.
+    """
+
+    for message in data.messages:
+        if message.role == "developer":
+            message.role = "system"
+
+
 async def apply_chat_template(data: ChatCompletionRequest):
     """
     Compile the prompt and get any additional stop strings from the template.
     Template stop strings can be overriden by sampler overrides if force is true.
     """
+
+    normalize_message_roles(data)
 
     # Locally store tools dict
     tools = data.model_dump()["tools"]
@@ -526,7 +540,11 @@ async def apply_chat_template(data: ChatCompletionRequest):
 
         raise HTTPException(400, error_message) from exc
     except TemplateError as exc:
-        error_message = handle_request_error(f"TemplateError: {str(exc)}").error.message
+        # The template rejected the request (e.g. an unsupported reasoning_effort),
+        # which is a client error rather than a server fault, so no traceback
+        error_message = handle_request_error(
+            f"TemplateError: {str(exc)}", exc_info=False
+        ).error.message
 
         raise HTTPException(400, error_message) from exc
 

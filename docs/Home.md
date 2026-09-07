@@ -1,6 +1,9 @@
 > [!IMPORTANT]
 > This documentation is under construction. URLs may change at any time. Thanks!
 
+> [!WARNING]
+> The ONLY official source for TabbyAPI information is this repository. Any other websites, downloads, or services claiming to represent TabbyAPI are unaffiliated and should be considered as malicious.
+
 Welcome to TabbyAPI!
 
 This wiki aims to provide a place for documenting various aspects of this project.

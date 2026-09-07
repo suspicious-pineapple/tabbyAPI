@@ -50,7 +50,21 @@ class NetworkConfig(BaseConfigModel):
         description=(
             "Disable HTTP token authentication with requests.\n"
             "WARNING: This will make your instance vulnerable!\n"
-            "Turn on this option if you are ONLY connecting from localhost."
+            "Only turn this on if nothing but trusted local clients can reach the API.\n"
+            "Note that web pages open in a browser on this machine also count as local\n"
+            "callers; restrict allowed_origins below if you disable auth."
+        ),
+    )
+    allowed_origins: Optional[List[str]] = Field(
+        ["*"],
+        description=(
+            'Origins allowed to call the API from a browser (default: ["*"]).\n'
+            "This is a CORS allowlist, not an auth mechanism: it only governs which\n"
+            "web pages a browser will let read this API's responses.\n"
+            'The default "*" means any site open in your browser can send requests to\n'
+            "this instance, which matters most when disable_auth is on. Restrict this to\n"
+            'your own frontends (e.g. ["http://localhost:8000"]) to close that off, or\n'
+            "use an empty list [] to block all browser (cross-origin) callers."
         ),
     )
     disable_fetch_requests: Optional[bool] = Field(
@@ -664,12 +678,13 @@ class MemoryConfig(BaseConfigModel):
         ge=0,
     )
     cuda_malloc_async: Optional[bool] = Field(
-        True,
+        False,
         description=(
-            "Use cudaMallocAsync backend in Torch (default: True).\n"
-            "Enabling this is generally preferable, but it may cause issues with certain\n"
-            "workloads. Try disabling it if you experience intermittent OoM errors. If\n"
-            "False, Torch will use the allocator defined by the system env"
+            "Use the cudaMallocAsync allocator backend in Torch (default: False).\n"
+            "When False, the allocator is left to the environment: unless\n"
+            "PYTORCH_CUDA_ALLOC_CONF is set, ExLlamaV3 enables expandable segments in\n"
+            "Torch's native allocator, which performs better than cudaMallocAsync.\n"
+            "Enable this to force the cudaMallocAsync backend instead."
         ),
     )
 

@@ -39,21 +39,26 @@ def _raise_exception(message):
     raise TemplateError(message)
 
 
-def _tojson_compat(value, indent=None, ensure_ascii=True):
-    """Compatibility JSON filter for chat templates.
+def _tojson_compat(value, ensure_ascii=False, indent=None, separators=None, sort_keys=False):
+    """JSON filter for chat templates, matching the transformers environment.
 
-    Some model templates call ``tojson(ensure_ascii=False)`` while the
-    bundled Jinja filter may not accept that keyword in sandboxed mode.
-
-    Returns a plain string, matching the transformers template environment:
-    autoescape is off, and a Markup return value would HTML-escape any plain
-    string a template concatenates with the filter's output.
+    Jinja's built-in ``tojson`` only takes ``indent``, HTML-escapes ``<``, ``>``,
+    ``&`` and ``'`` into unicode escapes, sorts keys and returns ``Markup``, so
+    templates calling ``tojson(ensure_ascii=False)`` fail on it and the ones that
+    don't render text the model never saw in training. This filter has the same
+    signature and defaults as the one transformers installs, so a template renders
+    the same bytes here as under transformers or vLLM: raw UTF-8 (escaping
+    non-ASCII text such as Chinese tool descriptions into ``\\uXXXX`` inflates
+    token counts several-fold), ``json.dumps`` default separators, insertion key
+    order, and a plain string return (autoescape is off, and a ``Markup`` value
+    would HTML-escape any plain string a template concatenates with it).
     """
     return json.dumps(
         value,
-        indent=indent,
         ensure_ascii=ensure_ascii,
-        separators=(",", ": "),
+        indent=indent,
+        separators=separators,
+        sort_keys=sort_keys,
     )
 
 

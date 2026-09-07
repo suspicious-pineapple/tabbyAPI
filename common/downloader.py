@@ -13,6 +13,7 @@ from rich.progress import Progress
 from typing import List, Optional
 
 from common.logger import get_progress_bar
+from common.status_display import status_display
 from common.tabby_config import config
 from common.utils import unwrap
 
@@ -157,40 +158,42 @@ async def hf_repo_download(
     xlogger.info(f"Saving {repo_id} to {str(download_path)}")
 
     try:
-        client_timeout = aiohttp.ClientTimeout(total=timeout)  # Turn off timeout
-        async with aiohttp.ClientSession(timeout=client_timeout) as session:
-            tasks = []
-            xlogger.info(f"Starting download for {repo_id}")
+        # The live status line must not be showing while the download bars run
+        async with status_display.suspended():
+            client_timeout = aiohttp.ClientTimeout(total=timeout)  # Turn off timeout
+            async with aiohttp.ClientSession(timeout=client_timeout) as session:
+                tasks = []
+                xlogger.info(f"Starting download for {repo_id}")
 
-            progress = get_progress_bar()
-            progress.start()
+                progress = get_progress_bar()
+                progress.start()
 
-            for repo_item in file_list:
-                tasks.append(
-                    _download_file(
-                        session,
-                        repo_item,
-                        token=token,
-                        download_path=download_path.resolve(),
-                        chunk_limit=chunk_limit,
-                        progress=progress,
-                    )
-                )
+                try:
+                    for repo_item in file_list:
+                        tasks.append(
+                            _download_file(
+                                session,
+                                repo_item,
+                                token=token,
+                                download_path=download_path.resolve(),
+                                chunk_limit=chunk_limit,
+                                progress=progress,
+                            )
+                        )
 
-            await asyncio.gather(*tasks)
-            progress.stop()
-            xlogger.info(f"Finished download for {repo_id}")
+                    await asyncio.gather(*tasks)
+                finally:
+                    progress.stop()
 
-            return download_path
+                xlogger.info(f"Finished download for {repo_id}")
+
+                return download_path
     except (asyncio.CancelledError, Exception) as exc:
         # Cleanup on cancel
         if download_path.is_dir():
             shutil.rmtree(download_path)
         else:
             download_path.unlink()
-
-        # Stop the progress bar
-        progress.stop()
 
         # Re-raise exception if the task isn't cancelled
         if not isinstance(exc, asyncio.CancelledError):

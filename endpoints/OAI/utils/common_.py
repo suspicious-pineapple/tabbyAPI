@@ -1,6 +1,10 @@
 import pathlib
 from common import model
-from endpoints.OAI.types.common import UsageStats
+from endpoints.OAI.types.common import (
+    CompletionTokensDetails,
+    PromptTokensDetails,
+    UsageStats,
+)
 from common.tabby_config import config
 from common.auth import get_key_permission
 from common.logger import xlogger
@@ -21,9 +25,16 @@ def get_usage_stats(
     completion_tokens = generation.get("gen_tokens", 0)
     usage_stats = UsageStats(
         prompt_tokens=prompt_tokens,
+        prompt_tokens_details=PromptTokensDetails(
+            cached_tokens=round(generation.get("cached_tokens") or 0)
+        ),
         prompt_time=generation.get("prompt_time"),
         prompt_tokens_per_sec=generation.get("prompt_tokens_per_sec"),
         completion_tokens=completion_tokens,
+        completion_tokens_details=CompletionTokensDetails(
+            accepted_prediction_tokens=generation.get("draft_accept") or 0,
+            rejected_prediction_tokens=generation.get("draft_reject") or 0,
+        ),
         completion_time=generation.get("gen_time"),
         completion_tokens_per_sec=generation.get("gen_tokens_per_sec"),
         total_tokens=prompt_tokens + completion_tokens,
@@ -46,11 +57,22 @@ def aggregate_usage_stats(usage_stats_list: list[UsageStats]) -> UsageStats:
     total_tokens = prompt_tokens + completion_tokens
     total_time = prompt_time + completion_time
 
+    # n > 1 generations share one prompt, so prompt-side details come from the
+    # first entry while generation-side counters accumulate
     usage_stats = UsageStats(
         prompt_tokens=prompt_tokens,
+        prompt_tokens_details=usl[0].prompt_tokens_details,
         prompt_time=prompt_time,
         prompt_tokens_per_sec=prompt_tokens_per_sec,
         completion_tokens=completion_tokens,
+        completion_tokens_details=CompletionTokensDetails(
+            accepted_prediction_tokens=sum(
+                us.completion_tokens_details.accepted_prediction_tokens for us in usl
+            ),
+            rejected_prediction_tokens=sum(
+                us.completion_tokens_details.rejected_prediction_tokens for us in usl
+            ),
+        ),
         completion_time=completion_time,
         completion_tokens_per_sec=completion_tokens_per_sec,
         total_tokens=total_tokens,

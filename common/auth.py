@@ -140,6 +140,20 @@ async def load_auth_keys(disable_from_config: bool):
             "want to share this instance with others."
         )
 
+        # A web page open in the browser also connects from localhost. With the
+        # wildcard CORS default it can reach every endpoint of an unauthenticated
+        # instance, admin ones included, without the user noticing.
+        from common.tabby_config import config
+
+        if "*" in (config.network.allowed_origins or []):
+            xlogger.warning(
+                'With authentication disabled and `allowed_origins` left at ["*"], any '
+                "website open in a browser on this machine can send requests to this "
+                "instance and read the responses, including admin endpoints. Set "
+                "`network.allowed_origins` to your own frontends (or []) unless you use a "
+                "browser-based frontend that needs it."
+            )
+
         return
 
     try:
