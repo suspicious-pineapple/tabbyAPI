@@ -42,6 +42,7 @@ from common.hardware import hardware_supports_exllamav3
 from common.health import HealthManager
 from common.errors import ContextLengthExceededError, validate_context_requirements
 from common.logger import xlogger
+from common.model_meta import read_model_meta
 from common.multimodal import MultimodalEmbeddingWrapper
 from common.networking import DisconnectHandler
 from common.optional_dependencies import check_package_version
@@ -667,6 +668,7 @@ class ExllamaV3Container:
         model_card = ModelCard(
             id=self.model_dir.name,
             parameters=model_params,
+            meta=read_model_meta(self.model_dir, n_ctx=self.max_seq_len, include_size=True),
         )
 
         return model_card
@@ -845,6 +847,15 @@ class ExllamaV3Container:
 
                 # Immediately cancel all jobs
                 await self.wait_for_jobs(skip_wait=True)
+
+                # Retire the previous generator before replacing it. Cancelling the
+                # jobs alone leaves its iteration task alive, parked on an emptied
+                # job condition that nothing will ever signal again, which keeps the
+                # old sync Generator reachable for the life of the process. close()
+                # stops the task and wakes any consumer still parked on a job queue.
+                # After a latch the task has already exited, so this is a no-op there.
+                if self.generator is not None:
+                    await self.generator.close()
 
             # Create new generator
             self.generator = AsyncGenerator(
@@ -1318,6 +1329,50 @@ class ExllamaV3Container:
 
         return finish_chunk
 
+    def _generator_latched(self) -> bool:
+        """
+        Whether the async generator is unusable. exllamav3 sets AsyncGenerator.error when
+        an exception escapes Generator.iterate(), which kills the iteration task for every
+        job. Errors it contains per job (reap_failed_job) never set it. A wrapper without
+        the attribute can't be inspected, so it is treated as latched to keep the historical
+        always-recreate behaviour.
+        """
+
+        return (
+            self.generator is None
+            or not hasattr(self.generator, "error")
+            or self.generator.error is not None
+        )
+
+    async def _recover_from_generation_error(self, ex: Exception, job):
+        """
+        Handle an exception raised while consuming a job. Recreating the generator cancels
+        every other in-flight request (wait_for_jobs), whose clients then get partial or
+        empty completions with HTTP 200, so that only happens when the generator actually
+        latched. A contained error leaves the generator healthy; the failed job is cancelled
+        in case the error came from this consumer rather than the engine, so it doesn't keep
+        generating into a queue nobody drains (cancel is a no-op for a job the engine reaped).
+        """
+
+        if self._generator_latched():
+            xlogger.error(
+                "FATAL ERROR with generation. "
+                "Attempting to recreate the generator. "
+                "If this fails, please restart the server.\n",
+                {"exception": str(ex)},
+            )
+            asyncio.ensure_future(self.create_generator())
+
+            await HealthManager.add_unhealthy_event(ex)
+        else:
+            xlogger.warning(
+                "Generation failed; error was contained to this request and the "
+                "generator is still healthy.",
+                {"exception": str(ex)},
+            )
+            if not job.cancelled:
+                await job.cancel()
+
     async def generate_gen(
         self,
         request_id: str,
@@ -1599,17 +1654,7 @@ class ExllamaV3Container:
                 await job.cancel()
 
         except Exception as ex:
-            # Create a new generator since the current state is broken
-            # No need to wait for this to finish
-            xlogger.error(
-                "FATAL ERROR with generation. "
-                "Attempting to recreate the generator. "
-                "If this fails, please restart the server.\n",
-                {"exception": str(ex)},
-            )
-            asyncio.ensure_future(self.create_generator())
-
-            await HealthManager.add_unhealthy_event(ex)
+            await self._recover_from_generation_error(ex, job)
 
             if isinstance(ex, AssertionError) and "cannot be enqueued" in str(ex):
                 raise ContextLengthExceededError(

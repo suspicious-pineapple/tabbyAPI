@@ -14,6 +14,7 @@ from common.logger import get_loading_progress_bar
 from common.multimodal import MultimodalEmbeddingWrapper
 from common.networking import handle_request_error
 from common.sampling import BaseSamplerRequest
+from common.status_display import status_display
 from common.tabby_config import config
 from common.optional_dependencies import dependencies
 from common.transformers_utils import HFModel
@@ -203,31 +204,33 @@ async def load_model_gen(model_path: pathlib.Path, **kwargs):
 
         load_status = new_container.load_gen(load_progress, **kwargs)
 
-        progress = get_loading_progress_bar()
-        progress.start()
+        # The live status line must not be showing while the loading bars run
+        async with status_display.suspended():
+            progress = get_loading_progress_bar()
+            progress.start()
 
-        try:
-            index = 0
-            async for module, modules in load_status:
-                current_model_type = model_type[index].value
-                if module == 0:
-                    loading_task = progress.add_task(
-                        f"[cyan]Loading {current_model_type} modules", total=modules
-                    )
-                else:
-                    progress.advance(loading_task)
+            try:
+                index = 0
+                async for module, modules in load_status:
+                    current_model_type = model_type[index].value
+                    if module == 0:
+                        loading_task = progress.add_task(
+                            f"[cyan]Loading {current_model_type} modules", total=modules
+                        )
+                    else:
+                        progress.advance(loading_task)
 
-                yield module, modules, current_model_type
+                    yield module, modules, current_model_type
 
-                if module == modules:
-                    # Move on to the next component; the last one ends the bars
-                    index += 1
-                    if index == len(model_type):
-                        progress.stop()
+                    if module == modules:
+                        # Move on to the next component; the last one ends the bars
+                        index += 1
+                        if index == len(model_type):
+                            progress.stop()
 
-            container = new_container
-        finally:
-            progress.stop()
+                container = new_container
+            finally:
+                progress.stop()
 
 
 async def load_model(model_path: pathlib.Path, **kwargs):

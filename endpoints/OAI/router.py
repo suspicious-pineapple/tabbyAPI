@@ -171,6 +171,29 @@ async def chat_completion_request(
         raise HTTPException(422, "/v1/chat/completions request cancelled by user.") from ex
 
 
+# Apply template endpoint (llama-server compatible)
+@router.post("/apply-template", dependencies=[Depends(check_api_key)])
+@router.post("/v1/apply-template", dependencies=[Depends(check_api_key)])
+async def apply_template_request(data: ChatCompletionRequest) -> dict:
+    """
+    Renders the chat template for the given messages without generating and
+    returns the resulting prompt. Clients use this to probe the template, e.g.
+    whether it reacts to a thinking toggle.
+    """
+
+    await check_model_container()
+
+    if model.container.prompt_template is None:
+        error_message = handle_request_error(
+            "Cannot apply a template because a prompt template is not set.",
+            exc_info=False,
+        ).error.message
+        raise HTTPException(422, error_message)
+
+    prompt, _ = await apply_chat_template(data)
+    return {"prompt": prompt}
+
+
 # Embeddings endpoint
 @router.post(
     "/v1/embeddings",

@@ -17,8 +17,17 @@ network:
 
   # Disable HTTP token authentication with requests.
   # WARNING: This will make your instance vulnerable!
-  # Turn on this option if you are ONLY connecting from localhost.
+  # Only turn this on if nothing but trusted local clients can reach the API.
+  # Note that web pages open in a browser on this machine also count as local
+  # callers; restrict allowed_origins below if you disable auth.
   disable_auth: false
+
+  # Origins allowed to call the API from a browser (default: ["*"]).
+  # This is a CORS allowlist, not authentication: "*" lets any site open in your
+  # browser send requests to this instance, which matters most when disable_auth
+  # is on. Restrict to your own frontends (e.g. ["http://localhost:8000"]) or use
+  # an empty list [] to block all browser (cross-origin) callers.
+  allowed_origins: ["*"]
 
   # Disable fetching external content in response to requests,such as images from URLs.
   disable_fetch_requests: false
@@ -370,11 +379,11 @@ memory:
   # budget is cached only partially, with a warning. Only applies when vision is enabled.
   sysmem_multimodal_cache: 1024
 
-  # Use cudaMallocAsync backend in Torch (default: True).
-  # Enabling this is generally preferable, but it may cause issues with certain
-  # workloads. Try disabling it if you experience intermittent OoM errors. If
-  # False, Torch will use the allocator defined by the system env
-  cuda_malloc_async: True
+  # Use the cudaMallocAsync allocator backend in Torch (default: False).
+  # When False, the allocator is left to the environment: unless PYTORCH_CUDA_ALLOC_CONF is set,
+  # ExLlamaV3 enables expandable segments in Torch's native allocator, which performs better
+  # than cudaMallocAsync. Enable this to force the cudaMallocAsync backend instead.
+  cuda_malloc_async: false
 
 # Options for development and experimentation
 developer:

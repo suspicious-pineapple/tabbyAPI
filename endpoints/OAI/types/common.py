@@ -6,13 +6,36 @@ from typing import Optional, Union
 from common.sampling import BaseSamplerRequest, get_default_sampler_value
 
 
+class PromptTokensDetails(BaseModel):
+    """OpenAI-style prompt token details: how much of the prompt came from the cache."""
+
+    cached_tokens: int = 0
+
+
+class CompletionTokensDetails(BaseModel):
+    """
+    OpenAI-style completion token details. Speculative decoding is reported in the
+    Predicted Outputs fields: draft tokens the model confirmed or discarded. Both are
+    0 without a draft model. completion_tokens counts only emitted tokens, so rejected
+    drafts are never double counted.
+    """
+
+    accepted_prediction_tokens: int = 0
+    rejected_prediction_tokens: int = 0
+
+
 class UsageStats(BaseModel):
     """Represents usage stats."""
 
     prompt_tokens: int
+    # Always present, like OpenAI's, so clients never see null here
+    prompt_tokens_details: PromptTokensDetails = Field(default_factory=PromptTokensDetails)
     prompt_time: Optional[float] = None
     prompt_tokens_per_sec: Optional[Union[float, str]] = None
     completion_tokens: int
+    completion_tokens_details: CompletionTokensDetails = Field(
+        default_factory=CompletionTokensDetails
+    )
     completion_time: Optional[float] = None
     completion_tokens_per_sec: Optional[Union[float, str]] = None
     total_tokens: int
