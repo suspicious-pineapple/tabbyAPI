@@ -40,6 +40,7 @@ from common.hardware import hardware_supports_exllamav3
 from common.health import HealthManager
 from common.errors import ContextLengthExceededError, validate_context_requirements
 from common.logger import xlogger
+from common.model_meta import read_model_meta
 from common.multimodal import MultimodalEmbeddingWrapper
 from common.networking import DisconnectHandler
 from common.optional_dependencies import check_package_version
@@ -662,6 +663,7 @@ class ExllamaV3Container:
         model_card = ModelCard(
             id=self.model_dir.name,
             parameters=model_params,
+            meta=read_model_meta(self.model_dir, n_ctx=self.max_seq_len, include_size=True),
         )
 
         return model_card

@@ -30,6 +30,7 @@ from endpoints.core.types.model import (
     ModelList,
     ModelLoadRequest,
     ModelLoadResponse,
+    ModelPropsModalities,
     ModelPropsResponse,
 )
 from endpoints.core.types.health import HealthCheckResponse
@@ -145,9 +146,11 @@ async def model_props() -> ModelPropsResponse:
     current_model_card = get_current_model()
     resp = ModelPropsResponse(
         total_slots=current_model_card.parameters.max_batch_size,
+        model_path=str(model.container.model_dir),
         default_generation_settings=ModelDefaultGenerationSettings(
             n_ctx=current_model_card.parameters.max_seq_len,
         ),
+        modalities=ModelPropsModalities(vision=bool(current_model_card.parameters.use_vision)),
     )
 
     if current_model_card.parameters.prompt_template_content:
