@@ -50,7 +50,9 @@ class NetworkConfig(BaseConfigModel):
         description=(
             "Disable HTTP token authentication with requests.\n"
             "WARNING: This will make your instance vulnerable!\n"
-            "Turn on this option if you are ONLY connecting from localhost."
+            "Only turn this on if nothing but trusted local clients can reach the API.\n"
+            "Note that web pages open in a browser on this machine also count as local\n"
+            "callers; restrict allowed_origins below if you disable auth."
         ),
     )
     allowed_origins: Optional[List[str]] = Field(

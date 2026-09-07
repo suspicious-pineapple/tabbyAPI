@@ -17,7 +17,9 @@ network:
 
   # Disable HTTP token authentication with requests.
   # WARNING: This will make your instance vulnerable!
-  # Turn on this option if you are ONLY connecting from localhost.
+  # Only turn this on if nothing but trusted local clients can reach the API.
+  # Note that web pages open in a browser on this machine also count as local
+  # callers; restrict allowed_origins below if you disable auth.
   disable_auth: false
 
   # Origins allowed to call the API from a browser (default: ["*"]).
