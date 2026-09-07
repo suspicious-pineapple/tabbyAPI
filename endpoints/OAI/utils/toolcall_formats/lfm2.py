@@ -37,8 +37,40 @@ _STR_RE = re.compile(r"'(?:[^'\\]|\\.)*'|\"(?:[^\"\\]|\\.)*\"")
 # A reserved word used as a keyword-argument name: identifier followed by '='.
 _RESERVED_KW_RE = re.compile(rf"\b({'|'.join(sorted(_RESERVED))})\s*(?==)")
 
-# Leading-zero integer literal (e.g. 07 -> 7), invalid in Python 3.
-_LEAD_ZERO_RE = re.compile(r"(?<![\w.])0(\d+)")
+# Leading-zero integer literal (e.g. 07 or 007 -> 7), invalid in Python 3.
+_LEAD_ZERO_RE = re.compile(r"(?<![\w.])0+(\d+)")
+
+# Raw control characters the model may leave inside a string literal, and
+# their escaped spellings.
+_CTRL_ESCAPES = {"\n": "\\n", "\r": "\\r", "\t": "\\t", "\x00": "\\x00"}
+
+
+def _escape_ctrl_chars_in_strings(text: str) -> str:
+    """Escape raw newlines, tabs and NULs inside quoted string literals.
+
+    The model sometimes writes a multi-line argument with literal line breaks
+    inside the quotes, which is not valid Python. Text outside string literals
+    is left untouched, and existing backslash escapes are preserved.
+    """
+    out = []
+    quote = None
+    i = 0
+    while i < len(text):
+        ch = text[i]
+        if quote:
+            if ch == "\\" and i + 1 < len(text):
+                out.append(text[i : i + 2])
+                i += 2
+                continue
+            if ch == quote:
+                quote = None
+            elif ch in _CTRL_ESCAPES:
+                ch = _CTRL_ESCAPES[ch]
+        elif ch in "'\"":
+            quote = ch
+        out.append(ch)
+        i += 1
+    return "".join(out)
 
 
 def _extract_tool_texts(text: str) -> list[str]:
@@ -101,9 +133,10 @@ def _safe_parse_list(text: str) -> tuple:
     except (SyntaxError, ValueError):
         pass
 
-    # Fallback path: protect strings, then rewrite reserved keywords and
-    # leading-zero ints independently, then restore strings and re-parse.
-    protected, literals = _protect_strings(text)
+    # Fallback path: escape control characters inside strings, protect the
+    # strings, then rewrite reserved keywords and leading-zero ints
+    # independently, then restore strings and re-parse.
+    protected, literals = _protect_strings(_escape_ctrl_chars_in_strings(text))
     reserved_map = {}
 
     def _reserved_repl(match):
@@ -147,6 +180,10 @@ def parse_toolcalls(text: str) -> list[ToolCall]:
     for block in _extract_tool_texts(text):
         module, reserved_map = _safe_parse_list(block)
         if module is None:
+            continue
+
+        # Empty or whitespace-only text parses to an empty module
+        if not module.body:
             continue
 
         node = getattr(module.body[0], "value", None)

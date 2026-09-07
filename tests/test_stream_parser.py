@@ -783,22 +783,14 @@ class Lfm2ToolcallFormatTests(unittest.TestCase):
 
     def test_single_call(self):
         calls = self.parse(
-            "<|tool_call_start|>"
-            "[browser_navigate(url='/home/user1/workspace')]"
-            "<|tool_call_end|>"
+            "<|tool_call_start|>[browser_navigate(url='/home/user1/workspace')]<|tool_call_end|>"
         )
         self.assertEqual(len(calls), 1)
         self.assertEqual(calls[0].function.name, "browser_navigate")
-        self.assertEqual(
-            calls[0].function.arguments, '{"url": "/home/user1/workspace"}'
-        )
+        self.assertEqual(calls[0].function.arguments, '{"url": "/home/user1/workspace"}')
 
     def test_parallel_calls(self):
-        calls = self.parse(
-            "<|tool_call_start|>"
-            '[f(a=1), g(b="x")]'
-            "<|tool_call_end|>"
-        )
+        calls = self.parse('<|tool_call_start|>[f(a=1), g(b="x")]<|tool_call_end|>')
         self.assertEqual(len(calls), 2)
         self.assertEqual(calls[0].function.name, "f")
         self.assertEqual(calls[0].function.arguments, '{"a": 1}')
@@ -821,15 +813,9 @@ class Lfm2ToolcallFormatTests(unittest.TestCase):
 
     def test_nested_quotes(self):
         # Single-quoted value containing an escaped double quote and a colon
-        calls = self.parse(
-            "<|tool_call_start|>"
-            '[f(command="echo \\"hi\\"")]'
-            "<|tool_call_end|>"
-        )
+        calls = self.parse('<|tool_call_start|>[f(command="echo \\"hi\\"")]<|tool_call_end|>')
         self.assertEqual(len(calls), 1)
-        self.assertEqual(
-            calls[0].function.arguments, r'{"command": "echo \"hi\""}'
-        )
+        self.assertEqual(calls[0].function.arguments, r'{"command": "echo \"hi\""}')
 
     def test_no_args(self):
         calls = self.parse("<|tool_call_start|>[list_files()]<|tool_call_end|>")
@@ -855,6 +841,40 @@ class Lfm2ToolcallFormatTests(unittest.TestCase):
     def test_malformed_returns_nothing(self):
         calls = self.parse("<|tool_call_start|>greetings, world<|tool_call_end|>")
         self.assertEqual(len(calls), 0)
+
+    def test_empty_text_returns_nothing(self):
+        # Non-streaming responses parse the tool text unconditionally, so an
+        # empty or whitespace-only block must not raise
+        for text in ("", "   ", "\n", "<|tool_call_start|><|tool_call_end|>"):
+            self.assertEqual(self.parse(text), [])
+
+    def test_raw_newline_inside_string(self):
+        # The model sometimes writes literal line breaks inside a quoted
+        # argument, which is invalid Python until escaped
+        calls = self.parse(
+            "<|tool_call_start|>"
+            '[write_file(path="list.txt", content="milk\neggs")]'
+            "<|tool_call_end|>"
+        )
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(
+            calls[0].function.arguments,
+            '{"path": "list.txt", "content": "milk\\neggs"}',
+        )
+
+    def test_raw_tab_and_existing_escape_inside_string(self):
+        calls = self.parse("<|tool_call_start|>[f(s='a\tb\\nc', t='x')]<|tool_call_end|>")
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0].function.arguments, '{"s": "a\\tb\\nc", "t": "x"}')
+
+    def test_newline_outside_strings_is_untouched(self):
+        calls = self.parse("<|tool_call_start|>[\n  f(a=1),\n  g(b=2)\n]<|tool_call_end|>")
+        self.assertEqual([c.function.name for c in calls], ["f", "g"])
+
+    def test_multi_digit_leading_zero(self):
+        calls = self.parse("<|tool_call_start|>[f(month=007, day=0)]<|tool_call_end|>")
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0].function.arguments, '{"month": 7, "day": 0}')
 
     def test_reserved_keyword_param(self):
         # A tool parameter named after a Python keyword cannot be parsed as
