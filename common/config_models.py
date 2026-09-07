@@ -664,12 +664,13 @@ class MemoryConfig(BaseConfigModel):
         ge=0,
     )
     cuda_malloc_async: Optional[bool] = Field(
-        True,
+        False,
         description=(
-            "Use cudaMallocAsync backend in Torch (default: True).\n"
-            "Enabling this is generally preferable, but it may cause issues with certain\n"
-            "workloads. Try disabling it if you experience intermittent OoM errors. If\n"
-            "False, Torch will use the allocator defined by the system env"
+            "Use the cudaMallocAsync allocator backend in Torch (default: False).\n"
+            "When False, the allocator is left to the environment: unless\n"
+            "PYTORCH_CUDA_ALLOC_CONF is set, ExLlamaV3 enables expandable segments in\n"
+            "Torch's native allocator, which performs better than cudaMallocAsync.\n"
+            "Enable this to force the cudaMallocAsync backend instead."
         ),
     )
 

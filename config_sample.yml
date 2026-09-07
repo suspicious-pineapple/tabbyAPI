@@ -370,11 +370,11 @@ memory:
   # budget is cached only partially, with a warning. Only applies when vision is enabled.
   sysmem_multimodal_cache: 1024
 
-  # Use cudaMallocAsync backend in Torch (default: True).
-  # Enabling this is generally preferable, but it may cause issues with certain
-  # workloads. Try disabling it if you experience intermittent OoM errors. If
-  # False, Torch will use the allocator defined by the system env
-  cuda_malloc_async: True
+  # Use the cudaMallocAsync allocator backend in Torch (default: False).
+  # When False, the allocator is left to the environment: unless PYTORCH_CUDA_ALLOC_CONF is set,
+  # ExLlamaV3 enables expandable segments in Torch's native allocator, which performs better
+  # than cudaMallocAsync. Enable this to force the cudaMallocAsync backend instead.
+  cuda_malloc_async: false
 
 # Options for development and experimentation
 developer:
