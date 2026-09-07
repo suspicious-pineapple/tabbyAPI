@@ -43,15 +43,21 @@ class GetUsageStatsTests(unittest.TestCase):
         self.assertEqual(stats.completion_tokens_details.accepted_prediction_tokens, 40)
         self.assertEqual(stats.completion_tokens_details.rejected_prediction_tokens, 8)
 
-    def test_absent_cache_and_draft_fields_stay_none(self):
+    def test_absent_cache_and_draft_fields_report_zero(self):
+        # The detail objects are always present, like OpenAI's, so clients never
+        # have to handle null; a server without a draft model reports zeros
         chunk = generation()
         for key in ("cached_tokens", "draft_accept", "draft_reject"):
             del chunk[key]
 
         stats = get_usage_stats(chunk)
 
-        self.assertIsNone(stats.prompt_tokens_details)
-        self.assertIsNone(stats.completion_tokens_details)
+        self.assertEqual(stats.prompt_tokens_details.cached_tokens, 0)
+        self.assertEqual(stats.completion_tokens_details.accepted_prediction_tokens, 0)
+        self.assertEqual(stats.completion_tokens_details.rejected_prediction_tokens, 0)
+        payload = stats.model_dump(mode="json")
+        self.assertEqual(payload["prompt_tokens_details"], {"cached_tokens": 0})
+        self.assertIsNotNone(payload["completion_tokens_details"])
 
     def test_fractional_cached_tokens_are_rounded_to_an_int(self):
         stats = get_usage_stats(generation(cached_tokens=899.6))
@@ -90,7 +96,7 @@ class AggregateUsageStatsTests(unittest.TestCase):
         self.assertEqual(aggregated.completion_tokens_details.accepted_prediction_tokens, 65)
         self.assertEqual(aggregated.completion_tokens_details.rejected_prediction_tokens, 13)
 
-    def test_draft_counters_stay_none_when_no_entry_reports_them(self):
+    def test_draft_counters_are_zero_when_no_entry_reports_them(self):
         chunk = generation()
         del chunk["draft_accept"]
         del chunk["draft_reject"]
@@ -98,7 +104,8 @@ class AggregateUsageStatsTests(unittest.TestCase):
 
         aggregated = aggregate_usage_stats([stats, get_usage_stats(chunk)])
 
-        self.assertIsNone(aggregated.completion_tokens_details)
+        self.assertEqual(aggregated.completion_tokens_details.accepted_prediction_tokens, 0)
+        self.assertEqual(aggregated.completion_tokens_details.rejected_prediction_tokens, 0)
 
     def test_partially_reported_draft_counters_sum_the_present_entries(self):
         with_draft = get_usage_stats(generation())
@@ -118,7 +125,7 @@ class AggregateUsageStatsTests(unittest.TestCase):
 
         aggregated = aggregate_usage_stats([stats, get_usage_stats(chunk)])
 
-        self.assertIsNone(aggregated.prompt_tokens_details)
+        self.assertEqual(aggregated.prompt_tokens_details.cached_tokens, 0)
 
 
 class UsageStatsSerializationTests(unittest.TestCase):
