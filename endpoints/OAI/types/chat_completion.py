@@ -84,8 +84,8 @@ class SFTSample(BaseModel):
     )
 class DPOSample(BaseModel):
     prompt: List[ChatCompletionMessage]
-    chosen: ChatCompletionMessage
-    rejected: ChatCompletionMessage
+    chosen: str
+    rejected: str
     template_vars: Optional[dict] = Field(
         default={},
         validation_alias=AliasChoices("template_vars", "chat_template_kwargs"),
@@ -102,7 +102,9 @@ class TrainingRequest(BaseModel):
 
 
 class TrainingResponse(BaseModel):
-    loss: float
+    steps: int
+    samples: int
+    skipped: int
     duration: float
 
 

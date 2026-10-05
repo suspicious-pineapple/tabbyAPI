@@ -852,14 +852,17 @@ class ExllamaV3Container:
         def render_segments(sample):
             turns = extract_rich_turns(sample["messages"])
             return seg_build(turns, **row_template_extras(sample))
-
+        def render_prompt(sample):
+            turns = extract_rich_turns(sample["prompt"])
+            return seg_build(turns, add_generation_prompt=True,**row_template_extras(sample))
+        
         self.qlora = RealtimeQLoRA(
             self.model, self.tokenizer,
             RealtimeConfig(
                 r=4, alpha=6, target_modules=["q_proj", "o_proj", "gate_proj", "up_proj","down_proj"],
-                lr=4e-5, batch_size=1,grad_accum=1,seq_len=4096, checkpoint_dir="/mnt/d/lora_modles/realtime",
-                checkpoint_every=20, keep_checkpoints=0), adapter_dir=None,
-                render_segments=render_segments, base_model_name_or_path=str(self.model_dir),
+                lr=4e-5, batch_size=1,grad_accum=2,seq_len=4096, checkpoint_dir="/mnt/d/lora_modles/realtime",
+                checkpoint_every=50, keep_checkpoints=0), adapter_dir=None,
+                render_segments=render_segments, render_prompt=render_prompt,base_model_name_or_path=str(self.model_dir),
         )
         self.qlora.attach_generator(self.generator.generator)
         xlogger.info("initialized trainable adapter")
