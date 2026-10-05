@@ -75,8 +75,17 @@ class ReasoningOptions(BaseModel):
     max_tokens: Optional[int] = None
 
 
-class TrainingSample(BaseModel):
+class SFTSample(BaseModel):
     messages: List[ChatCompletionMessage]
+    template_vars: Optional[dict] = Field(
+        default={},
+        validation_alias=AliasChoices("template_vars", "chat_template_kwargs"),
+        description="Aliases: chat_template_kwargs",
+    )
+class DPOSample(BaseModel):
+    prompt: List[ChatCompletionMessage]
+    chosen: ChatCompletionMessage
+    rejected: ChatCompletionMessage
     template_vars: Optional[dict] = Field(
         default={},
         validation_alias=AliasChoices("template_vars", "chat_template_kwargs"),
@@ -87,9 +96,10 @@ class TrainingSample(BaseModel):
 
 class TrainingRequest(BaseModel):
     """
-    List lists of messages to train on.
+    lists of messages to train on.
     """
-    samples: List[TrainingSample]
+    samples: List[Union[SFTSample,DPOSample]]
+
 
 class TrainingResponse(BaseModel):
     loss: float
