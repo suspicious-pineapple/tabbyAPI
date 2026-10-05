@@ -99,6 +99,7 @@ class TrainingRequest(BaseModel):
     lists of messages to train on.
     """
     samples: List[Union[SFTSample,DPOSample]]
+    lr: Optional[float] = Field(default=4e-5)
 
 
 class TrainingResponse(BaseModel):

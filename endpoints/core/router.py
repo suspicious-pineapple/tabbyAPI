@@ -308,6 +308,7 @@ async def load_lora(data: LoraLoadRequest) -> LoraLoadResponse:
 )
 async def train_lora(data: TrainingRequest) -> dict:
     print("ingesting training data")
+    model.container.qlora.lr=data.lr
     stats = model.container.qlora.ingest(data.model_dump(mode="python").get("samples"))
     print(stats)
     return dict(
