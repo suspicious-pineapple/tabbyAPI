@@ -908,6 +908,10 @@ class ExllamaV3Container:
 
             # Cleanup and update model load state
             self.loaded = True
+            try:
+                self.init_qlora()
+            except:
+                print("qlora creation failed")
             xlogger.info(f"Model loaded in {time.perf_counter() - load_start:.1f} s")
         finally:
             self.load_lock.release()
