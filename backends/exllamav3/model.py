@@ -1,4 +1,5 @@
 import asyncio
+from dataclasses import dataclass
 import gc
 import pathlib
 import re
@@ -20,6 +21,7 @@ from exllamav3 import (
     AsyncJob,
     Cache,
     Config,
+    Generator,
     Model,
     Tokenizer,
 )
@@ -39,7 +41,7 @@ from common.gen_logging import (
     log_prompt,
     log_request_start,
 )
-from common.hardware import hardware_supports_exllamav3
+from common.hardware import hardware_supports_exllamav3, torch_gpu_problem
 from common.health import HealthManager
 from common.errors import ContextLengthExceededError, validate_context_requirements
 from common.logger import xlogger
@@ -90,6 +92,104 @@ def _merge_stream_results(results: List[dict]) -> dict:
     return merged
 
 
+@dataclass
+class JobPhases:
+    """
+    The two sets of swappable settings of a running job: one for the model's
+    reasoning block, one for the rest of the response. Grammar filters belong
+    to the content phase only, so reasoning stays free-form.
+    """
+
+    job: Any
+    content_sampler: Any
+    reasoning_sampler: Any
+    content_banned: List[str]
+    reasoning_banned: List[str]
+    content_filters: list
+    reasoning: bool
+
+    # The content filters are on the job already, armed by the end-of-reasoning
+    # token: the engine activates them on the exact token, where a switch made
+    # from here lands a few tokens late (see set_generation_phase)
+    engine_trigger: bool = False
+
+    def differ(self) -> bool:
+        return bool(
+            self.content_filters
+            or self.reasoning_sampler is not self.content_sampler
+            or self.reasoning_banned != self.content_banned
+        )
+
+
+def reasoning_tag_conflicts(end_tag: Optional[str], strings: list) -> List[str]:
+    """
+    Stop strings and banned strings that contain the end-of-reasoning tag.
+    Text matching such a string is held back or rewound by the generator, so
+    the switch to the content settings can come late or not at all.
+    """
+
+    if not end_tag:
+        return []
+    tag = end_tag.lower()
+    return [s for s in strings if isinstance(s, str) and tag in s.lower()]
+
+
+def engine_supports_disk_cache() -> bool:
+    """
+    Whether the installed engine has the persistent disk cache tier
+    (exllamav3 1.6.2). Checked by attribute so a development checkout of the
+    engine qualifies regardless of its version string.
+    """
+
+    return hasattr(Generator, "flush_cache_to_disk")
+
+
+def disk_cache_kwargs(memory_config) -> dict:
+    """
+    The generator arguments for the persistent disk cache tier configured
+    under memory:, or an empty dict when it is disabled or can't be used.
+    The tier writes through from the system memory K/V tier, so it needs one.
+    """
+
+    directory = memory_config.disk_cache_dir
+    if not directory:
+        return {}
+
+    if not engine_supports_disk_cache():
+        xlogger.warning(
+            "disk_cache_dir needs ExLlamaV3 1.6.2 or later; the installed version "
+            "has no disk cache tier. Continuing without it."
+        )
+        return {}
+
+    if not memory_config.sysmem_kv_cache:
+        xlogger.warning(
+            "disk_cache_dir is set but sysmem_kv_cache is 0. The disk cache writes "
+            "through from the system memory K/V cache, so it needs one. "
+            "Continuing without the disk cache."
+        )
+        return {}
+
+    return {
+        "disk_cache_dir": str(pathlib.Path(directory).expanduser()),
+        "disk_cache_size": memory_config.disk_cache_size * 1024**2,
+        "disk_cache_flush_on_idle": bool(memory_config.disk_cache_flush_on_idle),
+        "disk_cache_checkpoint_interval": memory_config.disk_cache_checkpoint_interval,
+    }
+
+
+def _describe_reasoning_settings(reasoning_params: BaseSamplerRequest) -> str:
+    """The reasoning-phase overrides as "name: value (source)" items."""
+
+    parts = []
+    for name, value, source in reasoning_params.reasoning_settings():
+        if isinstance(value, (list, dict)):
+            unit = "tokens" if name in ("banned_tokens", "logit_bias") else "strings"
+            value = f"{len(value)} {unit}"
+        parts.append(f"{name}: {value} ({source})")
+    return ", ".join(parts)
+
+
 class ExllamaV3Container:
     """Model container for the ExLlamaV3 backend."""
 
@@ -115,6 +215,8 @@ class ExllamaV3Container:
     # The lock keeps load tasks sequential
     # The condition notifies any waiting tasks
     active_job_ids: Dict[str, Any]
+    job_phases: Dict[str, JobPhases]
+    recreate_task: Optional[asyncio.Task] = None
     loaded: bool = False
     load_lock: asyncio.Lock
     load_condition: asyncio.Condition
@@ -147,13 +249,18 @@ class ExllamaV3Container:
     draft_num_tokens: Optional[int] = None
     dynamic_draft: Optional[bool] = False
     ngram_match_min: int = 0
+    hybrid_draft_tokens: int = 0
     recurrent_checkpoint_interval: Optional[int] = None
     recurrent_checkpoint_interval_pp: Optional[int] = None
+    # Generator arguments for the persistent disk cache tier, resolved per load
+    # from memory.disk_cache_* (empty when disabled); never mutated in place
+    disk_cache_kwargs: dict = {}
 
     def __init__(self):
         # Mutable state must be created per instance. A class-level default
         # would be a single object shared by every container.
         self.active_job_ids = {}
+        self.job_phases = {}
         self.load_lock = asyncio.Lock()
         self.load_condition = asyncio.Condition()
         self.autosplit_reserve = [96 / 1024]
@@ -189,11 +296,17 @@ class ExllamaV3Container:
         self = cls()
 
         # Make sure ExllamaV3 is up to date
-        check_package_version("exllamav3", "1.5.1")
+        check_package_version("exllamav3", "1.6.1")
 
         self.model_dir = model_directory
         self.hf_model = hf_model
-        self.config = Config.from_directory(str(model_directory.resolve()))
+        # Optional RYS layer map (list of layer indices or a string spec such
+        # as "0..6,4..6"); must be set when the config is created so the model
+        # is built with the mapped layer order
+        self.config = Config.from_directory(
+            str(model_directory.resolve()),
+            layer_map=kwargs.get("layer_map"),
+        )
         self.model = Model.from_config(self.config)
         self.tokenizer = Tokenizer.from_config(self.config)
 
@@ -221,12 +334,34 @@ class ExllamaV3Container:
         if cpu_moe_threads is not None:
             self.config.infer_params.moe_cpu_threads = cpu_moe_threads
 
+        # Experimental: back the CPU MoE worker's expert arena with shared,
+        # page-locked memory, so streamed prefill DMAs experts straight from
+        # it and the expert split can promote experts into spare VRAM slots.
+        # None defers to the EXL3_MOE_PINNED_ARENA env variable
+        cpu_moe_pinned_arena = kwargs.get("cpu_moe_pinned_arena")
+        if cpu_moe_pinned_arena is not None:
+            self.config.infer_params.moe_cpu_pinned_arena = cpu_moe_pinned_arena
+        if getattr(self.config.infer_params, "moe_cpu_pinned_arena", False):
+            if self.config.infer_params.moe_cpu_offload or self.config.infer_params.moe_cpu_split:
+                xlogger.info("Using a pinned expert arena for CPU MoE (cpu_moe_pinned_arena).")
+            elif cpu_moe_pinned_arena:
+                xlogger.warning(
+                    "cpu_moe_pinned_arena has no effect without cpu_moe_offload_layers "
+                    "or cpu_moe_split_experts."
+                )
+
         # Load an n-gram embedding table (PLE models) fully into system RAM
         # instead of streaming rows from disk per forward. Must be set before
         # the model weights are loaded
         if unwrap(kwargs.get("ngram_ram"), False):
             self.config.infer_params.ngram_stream_from_disk = False
             xlogger.info("Loading n-gram embeddings into system RAM (ngram_ram).")
+
+        # Stream token embedding rows from disk per forward instead of holding
+        # the table in system RAM. Must be set before the weights are loaded
+        if unwrap(kwargs.get("embed_stream_from_disk"), False):
+            self.config.infer_params.embed_stream_from_disk = True
+            xlogger.info("Streaming token embeddings from disk (embed_stream_from_disk).")
 
         # Prepare vision model if requested in config
         self.vision_model = None
@@ -272,6 +407,13 @@ class ExllamaV3Container:
         )
         self.dynamic_draft = draft_args.get("dynamic_draft", False)
 
+        # Long suffix-match drafting on top of whichever drafting mode is
+        # active, or on its own: a job repeating its own context verbatim gets
+        # this many tokens of the earlier continuation as the round's draft
+        self.hybrid_draft_tokens = unwrap(draft_args.get("hybrid_draft_tokens"), 0)
+        if self.hybrid_draft_tokens < 0:
+            raise ValueError("hybrid_draft_tokens must be 0 (off) or greater")
+
         # Always disable draft if params are incorrectly configured
         if draft_mode == "model" and draft_args and draft_model_name is None:
             xlogger.warning(
@@ -291,6 +433,9 @@ class ExllamaV3Container:
                 draft_model_path = draft_model_path / draft_model_name
                 self.draft_model_dir = draft_model_path
                 self.draft_config = Config.from_directory(str(draft_model_path.resolve()))
+                self.draft_config.infer_params.moe_cpu_pinned_arena = getattr(
+                    self.config.infer_params, "moe_cpu_pinned_arena", False
+                )
                 self.draft_model = Model.from_config(self.draft_config)
                 xlogger.info(f"Using draft model: {str(draft_model_path.resolve())}")
         else:
@@ -300,6 +445,11 @@ class ExllamaV3Container:
                 xlogger.info(
                     f"Using n-gram drafting with minimum match length {self.ngram_match_min}"
                 )
+        if self.hybrid_draft_tokens:
+            xlogger.info(
+                f"Using hybrid drafting: {self.hybrid_draft_tokens} tokens drafted from a "
+                "matching earlier passage of the context."
+            )
 
         # Turn off GPU split if the user is using 1 GPU
         gpu_count = torch.cuda.device_count()
@@ -360,12 +510,16 @@ class ExllamaV3Container:
                     "autosplit_reserve is ignored for the draft model when draft_gpu_split is set."
                 )
 
+        # A CPU-only PyTorch or a GPU build without devices can't load anything
+        gpu_problem = torch_gpu_problem()
+        if gpu_problem:
+            raise RuntimeError(gpu_problem)
+
         if not hardware_supports_exllamav3(gpu_device_list):
             gpu_unsupported_message = (
                 "Unable to run ExllamaV3 because an unsupported GPU is "
                 "found in this configuration. \n"
-                "All GPUs must be turing "
-                "(20 series) or newer. AMD GPUs are not supported."
+                "All NVIDIA GPUs must be turing (20 series) or newer."
             )
 
             xlogger.warning(gpu_unsupported_message)
@@ -432,6 +586,10 @@ class ExllamaV3Container:
                 "recurrent_checkpoint_interval settings are ignored because "
                 "the model has no recurrent layers."
             )
+
+        # Persistent disk cache tier (resolved once per load, so the warnings
+        # don't repeat when the generator is recreated)
+        self.disk_cache_kwargs = disk_cache_kwargs(config.memory)
 
         # Create cache
         cache_mode_default = "FP16"
@@ -724,11 +882,12 @@ class ExllamaV3Container:
             default_draft_tokens = 4
         else:
             default_draft_tokens = 0
+        # A recurrent model's rollback window (max_history) has to cover the
+        # widest verification pass a round can take, a hybrid draft included
+        draft_tokens = unwrap(self.draft_num_tokens, default_draft_tokens)
         batch_draft_args = {
             "max_batch_size": self.max_batch_size,
-            "max_history": (
-                self.draft_num_tokens if self.draft_num_tokens is not None else default_draft_tokens
-            ),
+            "max_history": max(draft_tokens, self.hybrid_draft_tokens),
         }
 
         if split_cache_mode:
@@ -907,6 +1066,7 @@ class ExllamaV3Container:
         draft_tokens = 0
         if self.use_draft_model or self.ngram_match_min:
             draft_tokens = unwrap(self.draft_num_tokens, 4)
+        draft_tokens = max(draft_tokens, self.hybrid_draft_tokens)
         max_q_len = max(8, draft_tokens + 1)
 
         finished = object()
@@ -980,12 +1140,16 @@ class ExllamaV3Container:
                 if value:
                     yield value
 
+        # Without a manual split the engine autosplits with the reserve, over
+        # however many devices are visible
         if self.use_tp:
             split_mode = "tensor parallel"
-        elif self.gpu_split_auto:
-            split_mode = "autosplit"
-        else:
+        elif self.gpu_split:
             split_mode = "manual GPU split"
+        elif torch.cuda.device_count() == 1:
+            split_mode = "single GPU"
+        else:
+            split_mode = "autosplit"
 
         xlogger.info(f"Loading model {self.model_dir} ({split_mode})")
 
@@ -1002,7 +1166,15 @@ class ExllamaV3Container:
                 yield value
 
     async def create_generator(self):
-        """Create and save a Exllama generator class."""
+        """
+        Create and save a Exllama generator class.
+
+        When a generator already exists (recovery after a latched generation
+        error) it is closed, dereferenced and garbage collected before the
+        replacement is constructed. close() is what actually frees the old
+        generator's host-side caches: the failed jobs and their tracebacks keep
+        the object itself reachable for a while, so the collection is best-effort.
+        """
 
         try:
             # Don't acquire locks unless a model is loaded
@@ -1020,6 +1192,18 @@ class ExllamaV3Container:
                 # After a latch the task has already exited, so this is a no-op there.
                 if self.generator is not None:
                     await self.generator.close()
+
+                    # close() only releases the CPU K/V page cache tier. The old
+                    # Generator still owns its recurrent checkpoint cache (up to
+                    # sysmem_recurrent_cache of system RAM) and its pinned staging
+                    # buffers until it is collected, and the generator/page table
+                    # reference cycle keeps it alive until the cyclic GC runs. Held
+                    # through the constructor below, the old and the new caches are
+                    # resident at once, which on a host sized for one set means
+                    # swapping or the OOM killer in the middle of recovery.
+                    self.generator = None
+                    gc.collect()
+                    torch.cuda.empty_cache()
 
             # Recurrent checkpoint intervals are only passed when configured,
             # so the engine defaults apply otherwise
@@ -1047,7 +1231,9 @@ class ExllamaV3Container:
                 num_draft_tokens=self.draft_num_tokens,
                 dynamic_draft_tokens=self.dynamic_draft,
                 ngram_match_min=self.ngram_match_min,
+                hybrid_draft_tokens=self.hybrid_draft_tokens,
                 **checkpoint_kwargs,
+                **self.disk_cache_kwargs,
             )
 
             # Update the state of the container var
@@ -1062,6 +1248,19 @@ class ExllamaV3Container:
                     "Using recurrent checkpoint intervals: "
                     f"{generator.recurrent_checkpoint_interval} tokens (generation), "
                     f"{generator.recurrent_checkpoint_interval_pp} tokens (prompt ingestion)."
+                )
+
+            # What the disk cache directory already holds for this model and
+            # cache configuration (from an earlier process, usually)
+            disk_cache = getattr(generator, "disk_page_cache", None)
+            if disk_cache is not None:
+                stats = generator.get_cache_stats()
+                xlogger.info(
+                    f"Disk cache: {disk_cache.dir} holds {stats['disk_pages']:,} pages "
+                    f"({stats['disk_cached_tokens']:,} reusable tokens) and "
+                    f"{stats['disk_states']:,} recurrent checkpoints, "
+                    f"{stats['disk_used_bytes'] / 1024**3:.2f} GB of "
+                    f"{stats['disk_max_bytes'] / 1024**3:.2f} GB."
                 )
         finally:
             # This means the generator is being recreated
@@ -1104,6 +1303,13 @@ class ExllamaV3Container:
             # Clear the image embedding cache
             clear_image_embedding_cache()
 
+            # Retire the generator while the cache tensors are still there:
+            # closing it persists what is only in VRAM to the disk cache, and
+            # releases the host tiers through the tensor-parallel ranks
+            if self.generator is not None:
+                await self.generator.close()
+                self.generator = None
+
             self.model.unload()
             self.model = None
             self.config = None
@@ -1119,11 +1325,6 @@ class ExllamaV3Container:
             if self.use_vision:
                 self.vision_model.unload()
                 self.vision_model = None
-
-            # Cleanup the generator from any pending jobs
-            if self.generator is not None:
-                await self.generator.close()
-                self.generator = None
 
             gc.collect()
             torch.cuda.empty_cache()
@@ -1305,7 +1506,7 @@ class ExllamaV3Container:
         params: BaseSamplerRequest,
         disconnect_handler: DisconnectHandler = None,
         mm_embeddings: Optional[MultimodalEmbeddingWrapper] = None,
-        filter_trigger: str = None,
+        reasoning_phase: Optional[bool] = None,
         label: Optional[str] = None,
     ) -> AsyncIterator[Dict[str, Any]]:
         """
@@ -1317,8 +1518,12 @@ class ExllamaV3Container:
             params: Sampling and generation parameters.
             disconnect_handler: Disconnect context
             mm_embeddings: Optional multimodal embeddings.
-            filter_trigger: Delay filters (from params) until trigger text.
-                Must map to single token.
+            reasoning_phase: Whether the response starts inside a reasoning
+                block, for callers that track reasoning and report changes
+                through set_generation_phase(). While reasoning, the request's
+                reasoning overrides apply and grammar filters are off. None
+                (default) for callers that don't: one set of settings and
+                filters from the first token.
             label: Short name for the request in console logs.
 
         Yields:
@@ -1347,13 +1552,67 @@ class ExllamaV3Container:
                 params=params,
                 disconnect_handler=disconnect_handler,
                 mm_embeddings=mm_embeddings,
-                filter_trigger=filter_trigger,
+                reasoning_phase=reasoning_phase,
                 label=label,
             ):
                 yield generation_chunk
         finally:
             # Clean up and remove the job from active IDs
             del self.active_job_ids[request_id]
+
+    def set_generation_phase(self, request_id: str, reasoning: bool) -> bool:
+        """
+        Tell an active job that the response entered (True) or left (False) a
+        reasoning block, swapping in that phase's sampler, banned strings and
+        grammar filters. The swap applies from the next token the generator
+        samples; tokens it sampled ahead of the caller keep the old settings.
+        With speculative decoding that can be several tokens, which a sampler
+        tolerates and a grammar does not: it would start mid-answer. So where
+        the end-of-reasoning tag is a single token, the filters for the first
+        content block are armed by the engine on that token instead, and only
+        the cases it can't cover are switched from here.
+
+        Returns False if the swap has to wait (a forced-output injection is
+        still draining) and should be retried on the next chunk.
+        """
+
+        phases = self.job_phases.get(request_id)
+        if phases is None or phases.reasoning == reasoning:
+            return True
+
+        job = phases.job
+        if phases.content_filters:
+            # A forced-output injection (reasoning budget) switches a job's
+            # filters off, trigger included, so they have to be set again
+            suspended = getattr(getattr(job, "job", None), "filters_suspended", False)
+            if phases.engine_trigger and not reasoning and not suspended:
+                # The engine armed them itself when it sampled the end tag
+                phases.engine_trigger = False
+            else:
+                # Set from here they apply at once; the tag they were to wait
+                # for has passed
+                for content_filter in phases.content_filters:
+                    content_filter.trigger_token = None
+                phases.engine_trigger = False
+                try:
+                    job.set_filters([] if reasoning else phases.content_filters)
+                except ValueError:
+                    return False
+
+        if phases.reasoning_sampler is not phases.content_sampler:
+            job.set_sampler(phases.reasoning_sampler if reasoning else phases.content_sampler)
+
+        if phases.reasoning_banned != phases.content_banned:
+            try:
+                job.set_banned_strings(
+                    phases.reasoning_banned if reasoning else phases.content_banned
+                )
+            except AssertionError as ex:
+                # Recurrent models limit the length of a banned string
+                xlogger.warning(f"Could not switch banned strings: {ex}")
+
+        phases.reasoning = reasoning
+        return True
 
     def constrain_generation_output(self, request_id: str, text: str) -> bool:
         """
@@ -1551,13 +1810,22 @@ class ExllamaV3Container:
         """
 
         if self._generator_latched():
-            xlogger.error(
-                "FATAL ERROR with generation. "
-                "Attempting to recreate the generator. "
-                "If this fails, please restart the server.\n",
-                {"exception": str(ex)},
-            )
-            asyncio.ensure_future(self.create_generator())
+            # Every request in flight at the latch gets the same error and
+            # lands here; one recreation serves them all
+            pending = getattr(self, "recreate_task", None)
+            if pending is not None and not pending.done():
+                xlogger.debug(
+                    "Generator latched; a recreation is already in progress.",
+                    {"exception": str(ex)},
+                )
+            else:
+                xlogger.error(
+                    "FATAL ERROR with generation. "
+                    "Attempting to recreate the generator. "
+                    "If this fails, please restart the server.\n",
+                    {"exception": str(ex)},
+                )
+                self.recreate_task = asyncio.ensure_future(self.create_generator())
 
             await HealthManager.add_unhealthy_event(ex)
         else:
@@ -1576,7 +1844,7 @@ class ExllamaV3Container:
         params: BaseSamplerRequest,
         disconnect_handler: DisconnectHandler = None,
         mm_embeddings: Optional[MultimodalEmbeddingWrapper] = None,
-        filter_trigger: str = None,
+        reasoning_phase: Optional[bool] = None,
         label: Optional[str] = None,
     ):
         """
@@ -1598,6 +1866,15 @@ class ExllamaV3Container:
         )
         sampler = sampler_builder.build(params.temperature == 0)
         settings = list(sampler_builder.settings)
+
+        # A second stack for the reasoning block, if the request or the
+        # sampling config overrides anything there
+        reasoning_params = params.reasoning_params() if reasoning_phase is not None else None
+        reasoning_sampler = sampler
+        if reasoning_params is not None:
+            reasoning_sampler = ExllamaV3SamplerBuilder.from_params(
+                reasoning_params, self.tokenizer, self.max_seq_len
+            ).build(reasoning_params.temperature == 0)
 
         # Dynamically scale penalty range to output tokens
         # Only do this if freq/pres pen is enabled
@@ -1667,30 +1944,69 @@ class ExllamaV3Container:
             label,
         )
 
-        if params.json_schema or params.regex_pattern or params.grammar_string:
-            if filter_trigger is not None:
-                trigger_token_id = self.tokenizer.single_id(filter_trigger)
-                if trigger_token_id is None:
-                    xlogger.warning(
-                        "Unable to set trigger token for filters: no token ID for "
-                        f"`{filter_trigger}`."
-                    )
-            else:
-                trigger_token_id = None
+        # Grammar filters constrain the content only. With a caller tracking
+        # reasoning they come into force when the content begins: armed by the
+        # engine on the end-of-reasoning token if the tag is one token, else
+        # swapped in by set_generation_phase. Otherwise from the first token
+        trigger_token_id = None
+        constrained = params.json_schema or params.regex_pattern or params.grammar_string
+        if constrained and reasoning_phase and getattr(self, "reasoning", False):
+            if self.reasoning_end_token:
+                trigger_token_id = self.tokenizer.single_id(self.reasoning_end_token)
 
-            if params.json_schema:
-                grammar_handler.add_json_schema_filter(
-                    params.json_schema, self.tokenizer, trigger_token_id=trigger_token_id
-                )
+        if params.json_schema:
+            # After a reasoning block the model expects to start on a new line
+            grammar_handler.add_json_schema_filter(
+                params.json_schema,
+                self.tokenizer,
+                trigger_token_id=trigger_token_id,
+                allow_leading_whitespace=bool(reasoning_phase),
+            )
 
-            if params.regex_pattern:
-                grammar_handler.add_regex_filter(
-                    params.regex_pattern, self.tokenizer, trigger_token_id=trigger_token_id
-                )
+        if params.regex_pattern:
+            grammar_handler.add_regex_filter(
+                params.regex_pattern, self.tokenizer, trigger_token_id=trigger_token_id
+            )
 
-            if params.grammar_string:
-                grammar_handler.add_grammar_filter(
-                    params.grammar_string, self.tokenizer, trigger_token_id=trigger_token_id
+        if params.grammar_string:
+            grammar_handler.add_grammar_filter(
+                params.grammar_string, self.tokenizer, trigger_token_id=trigger_token_id
+            )
+
+        content_banned = list(params.banned_strings or [])
+        reasoning_banned = content_banned
+        if reasoning_params is not None:
+            reasoning_banned = list(reasoning_params.banned_strings or [])
+
+        phases = None
+        if reasoning_phase is not None:
+            phases = JobPhases(
+                job=None,
+                content_sampler=sampler,
+                reasoning_sampler=reasoning_sampler,
+                content_banned=content_banned,
+                reasoning_banned=reasoning_banned,
+                content_filters=list(grammar_handler.filters),
+                reasoning=reasoning_phase,
+                engine_trigger=trigger_token_id is not None,
+            )
+            if not phases.differ():
+                phases = None
+
+        # A stop or banned string spanning the end-of-reasoning tag delays or
+        # hides the tag from the caller that switches the settings on it
+        if phases is not None and getattr(self, "reasoning", False):
+            conflicts = reasoning_tag_conflicts(
+                self.reasoning_end_token,
+                [*(params.stop or []), *content_banned, *reasoning_banned],
+            )
+            if conflicts:
+                shown = ", ".join(repr(s) for s in dict.fromkeys(conflicts))
+                xlogger.warning(
+                    f"{label}: a stop string or banned string contains the end-of-reasoning "
+                    f"tag {self.reasoning_end_token!r} ({shown}). The switch from reasoning "
+                    "settings to content settings, including any grammar, relies on seeing "
+                    "that tag and may come late or not at all."
                 )
 
         # Generation controls, listed after the sampler settings
@@ -1719,36 +2035,41 @@ class ExllamaV3Container:
             settings.append(("loop_detect_window", params.loop_detect_window))
 
         settings_text = format_settings(settings, params)
-        log_request_start(
-            label,
-            context_len,
-            settings_text,
-            {
-                "request_id": request_id,
-                "prompt_tokens": context_len,
-                "settings": {name: str(value) for name, value in settings},
-            },
-        )
+        log_extra = {
+            "request_id": request_id,
+            "prompt_tokens": context_len,
+            "settings": {name: str(value) for name, value in settings},
+        }
+        if reasoning_params is not None:
+            reasoning_text = _describe_reasoning_settings(reasoning_params)
+            settings_text += f" · while reasoning: {reasoning_text}"
+            log_extra["reasoning_settings"] = reasoning_text
+        log_request_start(label, context_len, settings_text, log_extra)
+
+        in_reasoning = phases is not None and phases.reasoning
 
         generation = {}
         job = AsyncJob(
             self.generator,
-            sampler=sampler,
+            sampler=reasoning_sampler if in_reasoning else sampler,
             input_ids=input_ids,
             max_new_tokens=max_tokens,
             min_new_tokens=unwrap(params.min_tokens, 0),
             token_healing=unwrap(params.token_healing, False),
             decode_special_tokens=True,
             stop_conditions=stop_conditions,
-            banned_strings=params.banned_strings,
+            banned_strings=reasoning_banned if in_reasoning else content_banned,
             embeddings=mm_embeddings_content,
             return_top_tokens=params.top_logprobs,
             return_probs=bool(params.logprobs) or bool(params.top_logprobs),
             max_rq_tokens=max_rq_tokens,
             stop_on_loop=params.get_stop_on_loop(),
-            filters=grammar_handler.filters,
+            filters=([] if in_reasoning and not phases.engine_trigger else grammar_handler.filters),
         )
         self.active_job_ids[request_id] = job
+        if phases is not None:
+            phases.job = job
+            self.job_phases[request_id] = phases
         await disconnect_handler.add_cleanup_task(id(job), job.cancel, ())
         job_status = status_display.add_job(request_id, label, context_len)
 
@@ -1883,6 +2204,7 @@ class ExllamaV3Container:
             raise ex
         finally:
             status_display.remove_job(request_id)
+            self.job_phases.pop(request_id, None)
 
             # Log generation options to console
             # Some options are too large, so log the args instead

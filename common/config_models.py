@@ -104,6 +104,14 @@ class NetworkConfig(BaseConfigModel):
             "such as model list and health polls."
         ),
     )
+    web_ui: Optional[bool] = Field(
+        True,
+        description=(
+            "Serve the built-in chat client at /ui (default: True).\n"
+            "A static page for testing models and settings; it only uses the\n"
+            "regular API, so it does nothing until a browser opens it."
+        ),
+    )
 
     # Converts all strings in the api_servers list to lowercase
     # NOTE: Expand if more models need this validator
@@ -320,6 +328,27 @@ class ModelConfig(BaseConfigModel):
             "variable, then half the CPU core count."
         ),
     )
+    cpu_moe_pinned_arena: Optional[bool] = Field(
+        None,
+        description=(
+            "keep the CPU MoE worker's expert weights in shared, page-locked\n"
+            "memory (default: None). Streamed prefill then copies experts\n"
+            "straight from it to the GPU, and cpu_moe_split_experts can\n"
+            "promote frequently used experts into spare VRAM slots on the fly.\n"
+            "Costs about 0.2 s per GiB of offloaded experts at load. Only has an\n"
+            "effect with cpu_moe_offload_layers or cpu_moe_split_experts. When\n"
+            "unset, defers to the EXL3_MOE_PINNED_ARENA environment variable."
+        ),
+    )
+    layer_map: Optional[Union[List[int], str]] = Field(
+        None,
+        description=(
+            "RYS layer map for the exllamav3 backend (default: None).\n"
+            "Either a list of layer indices or a string spec of comma-separated\n"
+            "ints and inclusive ranges, e.g. '0..6,4..6'. Forward passes traverse\n"
+            "the model in this order; repeated layers get individual cache tensors."
+        ),
+    )
     ngram_ram: Optional[bool] = Field(
         False,
         description=(
@@ -328,6 +357,16 @@ class ModelConfig(BaseConfigModel):
             "(e.g. Qwen3.8-Flash-Next). By default the table is streamed from\n"
             "disk during inference; loading it into RAM avoids per-token disk\n"
             "reads at the cost of tens of GB of system memory."
+        ),
+    )
+    embed_stream_from_disk: Optional[bool] = Field(
+        False,
+        description=(
+            "Stream token embeddings from disk on demand (default: False).\n"
+            "Rows of the token embedding table are read per forward pass instead\n"
+            "of holding the whole table in system RAM. Saves memory on models\n"
+            "with large vocabularies at the cost of small disk reads during\n"
+            "inference. Works for quantized and unquantized tables."
         ),
     )
 
@@ -630,12 +669,7 @@ class DraftModelConfig(BaseConfigModel):
     )
     draft_num_tokens: Optional[int] = Field(
         None,
-        description=(
-            "Number of tokens to draft per iteration (default: draft model default)\n"
-            "Recurrent (linear or sliding attention) models use more VRAM for longer drafts.\n"
-            "This overhead multiplies with the max batch size, so for models with long drafts\n"
-            "(e.g. DFlash with 15 tokens by default) shorter drafts may be preferable."
-        ),
+        description=("Number of tokens to draft per iteration (default: draft model default)"),
     )
     dynamic_draft: Optional[bool] = Field(
         False,
@@ -650,6 +684,17 @@ class DraftModelConfig(BaseConfigModel):
             "Minimum match length for exllamav3 n-gram drafting (default: 2).\n"
             "Only used when draft_mode is ngram."
         ),
+    )
+    hybrid_draft_tokens: Optional[int] = Field(
+        0,
+        description=(
+            "Hybrid drafting: when the model is repeating a passage of its context\n"
+            "verbatim (reciting a drafted reply, editing source), draft this many\n"
+            "tokens of the earlier continuation in one verification pass (default: 0,\n"
+            "off). Works on top of any draft mode, or on its own. Longer values advance\n"
+            "more tokens at prefill speed on a hit, and cost a wider verification pass."
+        ),
+        ge=0,
     )
 
 
@@ -753,6 +798,45 @@ class MemoryConfig(BaseConfigModel):
     sysmem_kv_cache: Optional[int] = Field(
         0,
         description=("Size of system memory second-tier K/V cache, in MB (default: 0)"),
+    )
+    disk_cache_dir: Optional[str] = Field(
+        None,
+        description=(
+            "Directory for a persistent third-tier cache on disk (default: None).\n"
+            "K/V pages entering the system memory tier and recurrent checkpoints are\n"
+            "written through to disk and read back when a prompt's pages are in no\n"
+            "other tier, also in a later server process. Requires sysmem_kv_cache > 0\n"
+            "and ExLlamaV3 1.6.2 or later (ignored with a warning otherwise). Each\n"
+            "model and cache configuration gets its own subdirectory, so one directory\n"
+            "serves every model. Experimental."
+        ),
+    )
+    disk_cache_size: Optional[int] = Field(
+        51200,
+        description=(
+            "Size budget of the whole disk cache directory, in MB (default: 51200).\n"
+            "Shared by every model and cache configuration stored under disk_cache_dir;\n"
+            "the least recently used entries are removed to stay within it."
+        ),
+        gt=0,
+    )
+    disk_cache_flush_on_idle: Optional[bool] = Field(
+        True,
+        description=(
+            "Also write every complete page still in VRAM to the disk cache whenever\n"
+            "the generator goes idle, so a context is persisted without having to be\n"
+            "evicted first (default: True)."
+        ),
+    )
+    disk_cache_checkpoint_interval: Optional[int] = Field(
+        4096,
+        description=(
+            "Minimum spacing, in tokens, between the recurrent checkpoints the disk\n"
+            "cache keeps along a chain of cached pages (default: 4096). A resumed prompt\n"
+            "replays at most this many tokens. Checkpoints take far more space than\n"
+            "pages on hybrid models. 0 keeps every checkpoint."
+        ),
+        ge=0,
     )
     sysmem_multimodal_cache: Optional[int] = Field(
         1024,

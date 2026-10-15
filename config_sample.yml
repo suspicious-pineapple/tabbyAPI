@@ -13,6 +13,7 @@ network:
   host: 127.0.0.1
 
   # The port to host on (default: 5000).
+  # TabbyAPI exits if the port is taken rather than moving to another one.
   port: 5000
 
   # Disable HTTP token authentication with requests.
@@ -48,6 +49,11 @@ network:
   # Log every HTTP request with client address, method, path and status (default: False).
   # Generation requests are already logged in detail; this adds the rest, such as model list and health polls.
   access_log: false
+
+  # Serve the built-in chat client at /ui (default: True).
+  # A static page for testing models and settings; it only uses the
+  # regular API, so it does nothing until a browser opens it.
+  web_ui: true
 
 # Options for logging
 logging:
@@ -170,11 +176,31 @@ model:
   # defers to the EXL3_MOE_CPU_THREADS environment variable, then half the CPU core count.
   cpu_moe_threads:
 
+  # Keep the CPU MoE worker's expert weights in shared, page-locked memory (default: None).
+  # Streamed prefill then copies experts straight from it to the GPU, and cpu_moe_split_experts
+  # can promote frequently used experts into spare VRAM slots on the fly. Costs about 0.2 s per
+  # GiB of offloaded experts at load. Only has an effect with cpu_moe_offload_layers or
+  # cpu_moe_split_experts. When unset, defers to the EXL3_MOE_PINNED_ARENA environment variable.
+  cpu_moe_pinned_arena:
+
+  # RYS layer map for the exllamav3 backend (default: unset).
+  # Either a list of layer indices or a string spec of comma-separated ints and
+  # inclusive ranges, e.g. "0..6,4..6". Forward passes traverse the model in this
+  # order; repeated layers get individual cache tensors. Weights still load in the
+  # original layer order.
+  layer_map:
+
   # Load a model's n-gram embedding table fully into system RAM (default: False).
   # Only affects PLE models with n-gram embeddings (e.g. Qwen3.8-Flash-Next). By default
   # the table is streamed from disk during inference; loading it into RAM avoids
   # per-token disk reads at the cost of tens of GB of system memory.
   ngram_ram: false
+
+  # Stream token embeddings from disk on demand (default: False).
+  # Rows of the token embedding table are read per forward pass instead of holding the
+  # whole table in system RAM. Saves memory on models with large vocabularies at the cost
+  # of small disk reads during inference. Works for quantized and unquantized tables.
+  embed_stream_from_disk: false
 
   # NOTE: If a model has YaRN rope scaling, it will automatically be enabled by ExLlama.
   # rope_scale and rope_alpha settings won't apply in this case.
@@ -363,9 +389,6 @@ draft_model:
   draft_gpu_split: []
 
   # Number of tokens to draft per iteration (default: draft model default)
-  # Recurrent (linear or sliding attention) models use more VRAM for longer drafts.
-  # This overhead multiplies with the max batch size, so for models with long drafts
-  # (e.g. DFlash with 15 tokens by default) shorter drafts may be preferable.
   draft_num_tokens:
 
   # Adjust number of draft tokens dynamically based on observed acceptance rates (default: False)
@@ -375,6 +398,13 @@ draft_model:
   # Minimum match length for exllamav3 n-gram drafting (default: 2).
   # Only used when draft_mode is ngram.
   ngram_match_min: 2
+
+  # Hybrid drafting: when the model is repeating a passage of its context verbatim (reciting
+  # a drafted reply, editing source), draft this many tokens of the earlier continuation in
+  # one verification pass (default: 0, off). Works on top of any draft mode, or on its own.
+  # Longer values advance more tokens at prefill speed on a hit, and cost a wider
+  # verification pass.
+  hybrid_draft_tokens: 0
 
 # Options for Sampling
 sampling:
@@ -394,6 +424,16 @@ sampling:
   # min_p:
   #   override: 0.1
   #   force: true
+
+  # Settings nested under reasoning_override apply only while a model is reasoning;
+  # the response after the reasoning block uses the regular ones. Anything not listed
+  # is the same in both. Covers the sampler settings and banned_strings. For example:
+  # reasoning_override:
+  #   temperature:
+  #     override: 1.5
+  #     force: true
+  #   banned_strings:
+  #     override: ["but wait,"]
 
 # Options for Loras
 lora:
@@ -430,6 +470,29 @@ memory:
 
   # Size of system memory second-tier K/V cache, in MB (default: 0)
   sysmem_kv_cache: 0
+
+  # Directory for a persistent third-tier cache on disk (default: None).
+  # K/V pages entering the system memory tier and recurrent checkpoints are written through
+  # to disk and read back when a prompt's pages are in no other tier, also in a later server
+  # process. Requires sysmem_kv_cache > 0 and ExLlamaV3 1.6.2 or later (ignored with a warning
+  # otherwise). Each model and cache configuration gets its own subdirectory, so one directory
+  # serves every model. Experimental.
+  disk_cache_dir:
+
+  # Size budget of the whole disk cache directory, in MB (default: 51200).
+  # Shared by every model and cache configuration stored under disk_cache_dir; the least
+  # recently used entries are removed to stay within it.
+  disk_cache_size: 51200
+
+  # Also write every complete page still in VRAM to the disk cache whenever the generator
+  # goes idle, so a context is persisted without having to be evicted first (default: True).
+  disk_cache_flush_on_idle: true
+
+  # Minimum spacing, in tokens, between the recurrent checkpoints the disk cache keeps along
+  # a chain of cached pages (default: 4096). A resumed prompt replays at most this many
+  # tokens. Checkpoints take far more space than pages on hybrid models. 0 keeps every
+  # checkpoint.
+  disk_cache_checkpoint_interval: 4096
 
   # Size of the image embedding cache in system memory, in MB (default: 1024).
   # Encoded images are kept so repeated turns of a conversation don't re-run the vision model.
