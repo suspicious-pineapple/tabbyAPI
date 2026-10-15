@@ -3,7 +3,9 @@
 import asyncio
 import itertools
 import json
+import platform
 import socket
+import sys
 import traceback
 from fastapi import Depends, HTTPException, Request
 from loguru import logger
@@ -38,10 +40,12 @@ class TabbyRequestError(BaseModel):
     error: TabbyRequestErrorMessage
 
 
-def get_generator_error(message: str, exc_info: bool = True):
+def get_generator_error(
+    message: str, exc_info: bool = True, exception: Optional[BaseException] = None
+):
     """Get a generator error."""
 
-    generator_error = handle_request_error(message, exc_info)
+    generator_error = handle_request_error(message, exc_info, exception)
 
     return generator_error.model_dump_json()
 
@@ -53,10 +57,17 @@ def get_context_length_generator_error(message: str):
     return json.dumps(context_length_error_content(message))
 
 
-def handle_request_error(message: str, exc_info: bool = True):
-    """Log a request error to the console."""
+def handle_request_error(
+    message: str, exc_info: bool = True, exception: Optional[BaseException] = None
+):
+    """
+    Log a request error to the console. The traceback is the exception being
+    handled, or exception when it was caught elsewhere (e.g. in another task).
+    """
 
-    trace = traceback.format_exc()
+    if exception is None:
+        exception = sys.exc_info()[1]
+    trace = "".join(traceback.format_exception(exception)) if exception else ""
     send_trace = config.network.send_tracebacks
 
     error_message = TabbyRequestErrorMessage(message=message, trace=trace if send_trace else None)
@@ -192,17 +203,47 @@ async def run_with_request_disconnect(
         raise HTTPException(422, disconnect_message) from ex
 
 
-def is_port_in_use(port: int) -> bool:
+def port_bind_error(host: str, port: int) -> Optional[str]:
     """
-    Checks if a port is in use
+    Why the server could not listen on host:port, or None if it can.
 
-    From https://stackoverflow.com/questions/2470971/fast-way-to-test-if-a-port-is-in-use-using-python
+    Checks by binding a throwaway socket to the same address the server will
+    bind, with the same options, so the answer matches what the server is about
+    to find out. (Connecting to localhost instead, as this used to, answers a
+    different question: it reports a listener on the loopback interface whether
+    or not it blocks our bind, e.g. a Docker port mapping while the server is
+    configured for another interface, and misses listeners on other interfaces.)
     """
 
-    test_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    test_socket.settimeout(1)
-    with test_socket:
-        return test_socket.connect_ex(("localhost", port)) == 0
+    try:
+        addresses = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM, flags=socket.AI_PASSIVE)
+    except socket.gaierror as ex:
+        return f"{host} is not a usable address: {ex}"
+
+    for family, socktype, proto, _, sockaddr in addresses:
+        try:
+            probe = socket.socket(family, socktype, proto)
+        except OSError:
+            # Address family not supported here (e.g. IPv6 disabled)
+            continue
+
+        with probe:
+            # The server's event loop sets the same options: reuse of a port
+            # left in TIME_WAIT on POSIX (never on Windows, where the flag
+            # lets a second listener take over the port), one socket per
+            # address family
+            if family == socket.AF_INET6 and hasattr(socket, "IPV6_V6ONLY"):
+                probe.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 1)
+            if platform.system() != "Windows":
+                probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+
+            try:
+                probe.bind(sockaddr)
+            except OSError as ex:
+                reason = ex.strerror or str(ex)
+                return f"{reason} ({sockaddr[0]}:{sockaddr[1]})"
+
+    return None
 
 
 # Short per-process serial for console log lines; the UUID stays the API-facing id

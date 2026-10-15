@@ -15,8 +15,8 @@ from common import gen_logging, sampling
 from common.args import convert_args_to_dict, init_argparser
 from common.auth import load_auth_keys
 from common.actions import run_subcommand
-from common.logger import set_console_timestamps, setup_logger, xlogger
-from common.networking import is_port_in_use
+from common.logger import setup_logger, xlogger
+from common.networking import port_bind_error
 from common.optional_dependencies import dependencies
 from common.signals import signal_handler
 from common.status_display import status_display
@@ -32,22 +32,28 @@ async def entrypoint_async():
     host = config.network.host
     port = config.network.port
 
-    # Check if the port is available and attempt to bind a fallback
-    if is_port_in_use(port):
-        fallback_port = port + 1
+    # Say so up front if the installed PyTorch can't use a GPU, rather than
+    # leaving it to surface as an obscure failure on the first model load
+    if dependencies.torch:
+        from common.hardware import torch_gpu_problem
 
-        if is_port_in_use(fallback_port):
-            logger.error(
-                f"Ports {port} and {fallback_port} are in use by different services.\n"
-                "Please free up those ports or specify a different one.\n"
-                "Exiting."
-            )
+        gpu_problem = torch_gpu_problem()
+        if gpu_problem:
+            logger.error(gpu_problem)
 
-            return
-        else:
-            logger.warning(f"Port {port} is currently in use. Switching to {fallback_port}.")
+    # Make sure the configured address can be bound before spending time on
+    # a model load. No silent fallback to another port: clients are configured
+    # for this one, so a server that quietly moves is worse than one that stops
+    bind_error = port_bind_error(host, port)
+    if bind_error:
+        logger.error(
+            f"Cannot listen on {host}:{port}: {bind_error}\n"
+            "Another program is using that address. Stop it, or set a different "
+            "port with `network.port` in config.yml or --port.\n"
+            "Exiting."
+        )
 
-            port = fallback_port
+        return
 
     # Set sampler parameter overrides if provided. Do this before the model
     # load so a bad preset name fails fast instead of after a long load
@@ -159,9 +165,8 @@ def entrypoint(
 
     dict_args = convert_args_to_dict(args, parser)
 
-    # load config
+    # load config (also applies logging.log_timestamps to the console)
     config.load(dict_args)
-    set_console_timestamps(config.logging.log_timestamps)
 
     # optionally enable seqlog logging
     if config.developer.seqlog:
@@ -170,16 +175,28 @@ def entrypoint(
             api_key=config.developer.seqlog_api_key,
         )
 
+    # A ROCm torch needs two things settled before it or Triton is imported
+    from common.hardware import installed_torch_is_rocm
+
+    rocm_torch = installed_torch_is_rocm()
+    if rocm_torch:
+        # AMD's Triton build ships both backends and refuses to pick one on a machine
+        # that also has the NVIDIA driver
+        os.environ.setdefault("TRITON_DEFAULT_BACKEND", "amd")
+
     # We need to configure the allocator before importing Torch
-    if config.memory.cuda_malloc_async:
+    if config.memory.cuda_malloc_async and rocm_torch:
+        xlogger.warning(
+            "memory.cuda_malloc_async is ignored on ROCm: the cudaMallocAsync "
+            "allocator backend is CUDA-only."
+        )
+    elif config.memory.cuda_malloc_async:
+        import sys
+
         env_key1 = "PYTORCH_ALLOC_CONF"
         env_key2 = "PYTORCH_CUDA_ALLOC_CONF"
         new_alloc_config = "backend:cudaMallocAsync"
         prev_alloc_config = os.environ.get(env_key1, os.environ.get(env_key2))
-        os.environ[env_key1] = new_alloc_config
-        os.environ[env_key2] = new_alloc_config
-        import sys
-
         if "torch" in sys.modules and prev_alloc_config != new_alloc_config:
             xlogger.warning(
                 "`torch` was imported before config could be loaded. Unable to configure "
@@ -187,6 +204,8 @@ def entrypoint(
                 + (prev_alloc_config or "(Torch default)")
             )
         else:
+            os.environ[env_key1] = new_alloc_config
+            os.environ[env_key2] = new_alloc_config
             xlogger.info("Configured backend: cudaMallocAsync")
 
     # branch to default paths if required

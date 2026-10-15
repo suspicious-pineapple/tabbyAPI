@@ -10,10 +10,82 @@ from ruamel.yaml import YAML
 from ruamel.yaml.comments import CommentedMap, CommentedSeq
 from ruamel.yaml.scalarstring import PreservedScalarString
 
-from common.config_models import BaseConfigModel, TabbyConfigModel
+from common.config_models import (
+    BaseConfigModel,
+    DraftModelConfig,
+    ModelConfig,
+    TabbyConfigModel,
+)
+from common.logger import set_console_timestamps
 from common.utils import deep_merge_dicts, filter_none_values, unwrap
 
 yaml = YAML(typ=["rt", "safe"])
+
+
+# Model and draft options that are not properties of one model load, so an
+# inline load isn't expected to inherit them
+_SERVER_LEVEL_MODEL_KEYS = {
+    "model_dir",
+    "model_name",
+    "inline_model_loading",
+    "use_as_default",
+    "use_dummy_models",
+    "dummy_model_names",
+}
+_SERVER_LEVEL_DRAFT_KEYS = {"draft_model_dir"}
+
+
+def _is_default(model_cls, key: str, value) -> bool:
+    """Whether a config value equals the field's default (unknown keys never do)."""
+
+    field = model_cls.model_fields.get(key)
+    if field is None:
+        return False
+    return value == field.get_default(call_default_factory=True)
+
+
+def inline_loading_warnings(merged: dict) -> list[str]:
+    """
+    Options in the config's model and draft_model sections only apply to the
+    model loaded at startup. A model loaded by request (inline loading) gets its
+    options from the model folder's tabby_config.yml and from the keys named in
+    use_as_default, and the built-in defaults otherwise, which for context and
+    cache size means the model's native maximum. Say so when inline loading is
+    on and the config sets options that would be skipped that way.
+    """
+
+    # The merged dict holds what the file, environment and arguments actually
+    # set (validators fill in more on the model, so its fields_set is no guide)
+    model = unwrap(merged.get("model"), {})
+    if not model.get("inline_model_loading"):
+        return []
+
+    # An option set to its default value is skipped without effect
+    inherited = set(unwrap(model.get("use_as_default"), []))
+    skipped = sorted(
+        key
+        for key in set(model) - _SERVER_LEVEL_MODEL_KEYS - inherited
+        if not _is_default(ModelConfig, key, model[key])
+    )
+    draft = unwrap(merged.get("draft_model"), {})
+    skipped_draft = sorted(
+        key
+        for key in set(draft) - _SERVER_LEVEL_DRAFT_KEYS - inherited
+        if not _is_default(DraftModelConfig, key, draft[key])
+    )
+    if not skipped and not skipped_draft:
+        return []
+
+    listed = ", ".join(skipped + [f"draft_model.{key}" for key in skipped_draft])
+    message = (
+        "Models loaded by request ignore these options unless they are in "
+        f"model.use_as_default or the model's tabby_config.yml: {listed} "
+        "(max_seq_len and cache_size then default to the model's native context "
+        "length)."
+    )
+    if not model.get("model_name"):
+        message += " No model_name is set, so they currently apply to nothing."
+    return [message]
 
 
 class TabbyConfig(TabbyConfigModel):
@@ -45,6 +117,10 @@ class TabbyConfig(TabbyConfigModel):
             value = getattr(merged_config_model, field)
             setattr(self, field, value)
 
+        # Before anything below logs, so the config's own warnings are
+        # formatted the way it asks
+        set_console_timestamps(self.logging.log_timestamps)
+
         # Set model defaults dict once to prevent on-demand reconstruction
         # TODO: clean this up a bit
         for field in self.model.use_as_default:
@@ -54,6 +130,9 @@ class TabbyConfig(TabbyConfigModel):
                 self.draft_model_defaults[field] = getattr(config.draft_model, field)
             else:
                 logger.error(f"invalid item {field} in config option `model.use_as_default`")
+
+        for message in inline_loading_warnings(merged_config):
+            logger.warning(message)
 
     def _from_file(self, config_path: pathlib.Path):
         """loads config from a given file path"""
