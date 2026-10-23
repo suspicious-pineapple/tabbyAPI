@@ -1007,6 +1007,19 @@ class ExllamaV3Container:
 
 
     def init_qlora(self,**kwargs):
+        vdata, encoder = None,None
+        if self.use_vision:
+            from vision_data import VisionData, resolve_placeholder_id
+            from exllamav3.training.vision import VisionEncoder, downscale_image
+            encoder = VisionEncoder(
+                self.config,
+                self.tokenizer,
+                device="cuda:0",
+                max_pixels=0,
+                cache_bytes=2*(1<<30)
+                )
+            vdata = VisionData(encoder,self.tokenizer,mrope=False,placeholder_id=resolve_placeholder_id(self.config,self.tokenizer))
+
         seg_build, _, eot = jinja_renderers(self.model_dir, tokenizer_special_tokens(self.tokenizer), default_vars=self.template_vars_default)
         def render_segments(sample):
             turns = extract_rich_turns(sample["messages"])
@@ -1022,8 +1035,10 @@ class ExllamaV3Container:
                 lr=4e-5, batch_size=1,grad_accum=2,seq_len=4096, checkpoint_dir="/mnt/d/lora_modles/realtime",
                 checkpoint_every=50, keep_checkpoints=0), adapter_dir=None,
                 render_segments=render_segments, render_prompt=render_prompt,base_model_name_or_path=str(self.model_dir),
+        vision=vdata
         )
         self.qlora.attach_generator(self.generator.generator)
+        self.qlora.attach_aux_models(encoder.model if encoder else None)
         xlogger.info("initialized trainable adapter")
         xlogger.info(f" -- realtime adapter: {self.qlora.net.num_trainable():,} trainable params, "
           f"lr {self.qlora.lr:g}, targets {' '.join(self.qlora.net.target_modules)}")
