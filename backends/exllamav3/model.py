@@ -1009,7 +1009,7 @@ class ExllamaV3Container:
     def init_qlora(self,**kwargs):
         vdata, encoder = None,None
         if self.use_vision:
-            from vision_data import VisionData, resolve_placeholder_id
+            from backends.exllamav3.vision_data import VisionData, resolve_placeholder_id
             from exllamav3.training.vision import VisionEncoder, downscale_image
             encoder = VisionEncoder(
                 self.config,
