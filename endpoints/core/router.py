@@ -374,7 +374,7 @@ async def train_lora(data: TrainingRequest) -> dict:
     model.container.qlora.lr=data.lr
     stats = model.container.qlora.ingest(data.model_dump(mode="python").get("samples"))
     print(stats)
-    await model.container.load_lock.release()
+    model.container.load_lock.release()
     return dict(
         stats
     )

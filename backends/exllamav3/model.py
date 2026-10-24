@@ -1011,12 +1011,14 @@ class ExllamaV3Container:
         if self.use_vision:
             from backends.exllamav3.vision_data import VisionData, resolve_placeholder_id
             from exllamav3.training.vision import VisionEncoder, downscale_image
+            
             encoder = VisionEncoder(
                 self.config,
                 self.tokenizer,
                 device="cuda:0",
                 max_pixels=0,
-                cache_bytes=2*(1<<30)
+                cache_bytes=2*(1<<30),
+                provided_model=self.vision_model
                 )
             vdata = VisionData(encoder,self.tokenizer,mrope=False,placeholder_id=resolve_placeholder_id(self.config,self.tokenizer))
 
