@@ -63,8 +63,10 @@ from endpoints.OAI.utils.tools import (
     detect_tool_format,
     is_supported_format,
 )
-
-from exllamav3.training.realtime import RealtimeQLoRA, RealtimeConfig
+try:
+    from exllamav3.training.realtime import RealtimeQLoRA, RealtimeConfig
+except:
+    print("qlora import failed")
 from backends.exllamav3.chat_jinja import (jinja_renderers, tokenizer_special_tokens, extract_rich_turns, row_template_extras, parse_template_vars)
 
 
