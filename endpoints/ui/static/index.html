@@ -5,7 +5,9 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>TabbyAPI Chat</title>
   <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%23c2410c'/%3E%3Ctext x='16' y='22' font-family='sans-serif' font-size='16' font-weight='700' fill='white' text-anchor='middle'%3ET%3C/text%3E%3C/svg%3E">
+  <script src="theme.js"></script>
   <link rel="stylesheet" href="style.css">
+  <link rel="stylesheet" href="themes.css">
 </head>
 <body>
   <div id="app">
@@ -26,25 +28,26 @@
           <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7V5h16v2M9 19h6M12 5v14"/></svg>
           <span id="markdown-label">Replies</span>
         </button>
-        <button id="toggle-theme" class="sidebar-item" type="button">
-          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z"/></svg>
-          <span id="theme-label">Theme</span>
-        </button>
+        <label class="sidebar-item theme-picker">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3a9 9 0 0 0 0 18c1.1 0 1.7-.8 1.7-1.7 0-.4-.2-.8-.4-1.1a1.7 1.7 0 0 1 1.3-2.8H17a4 4 0 0 0 4-4C21 6.6 17 3 12 3z"/><circle cx="7.5" cy="11" r="1"/><circle cx="10" cy="7" r="1"/><circle cx="14.5" cy="7" r="1"/><circle cx="17" cy="11" r="1"/></svg>
+          <span>Theme</span>
+          <select id="theme-select"></select>
+        </label>
       </div>
     </aside>
 
     <!-- Conversation -->
     <main id="main">
       <header id="topbar">
-        <button class="icon-button only-narrow" data-drawer="sidebar" type="button" aria-label="Chats">
-          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 6h16M4 12h16M4 18h16"/></svg>
+        <button class="icon-button panel-toggle" data-drawer="sidebar" type="button" aria-controls="sidebar" aria-label="Chats">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="4" width="18" height="16" rx="2"/><path d="M9 4v16"/></svg>
         </button>
         <div id="topbar-model" class="topbar-model">
           <span id="model-dot" class="dot"></span>
           <span id="topbar-model-name">No model</span>
         </div>
-        <button class="icon-button only-medium" data-drawer="panel" type="button" aria-label="Settings">
-          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7h10M18 7h2M4 17h4M12 17h8"/><circle cx="16" cy="7" r="2"/><circle cx="10" cy="17" r="2"/></svg>
+        <button class="icon-button panel-toggle" data-drawer="panel" type="button" aria-controls="panel" aria-label="Settings">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="4" width="18" height="16" rx="2"/><path d="M15 4v16"/></svg>
         </button>
       </header>
 
@@ -107,6 +110,9 @@
         <details id="load-options-details" class="load-options">
           <summary>Load options <span id="load-options-note" class="muted"></span></summary>
           <textarea id="load-options" rows="9" wrap="off" spellcheck="false" placeholder="max_seq_len: 16384&#10;cache_mode: Q8&#10;draft_model:&#10;  draft_mode: ngram"></textarea>
+          <div class="button-row">
+            <button id="save-load-options" type="button" disabled title="Write these options to the model's tabby_config.yml, leaving out any that only repeat config.yml's use_as_default. An existing file is kept as tabby_config.bak.">Save to tabby_config.yml</button>
+          </div>
           <p class="hint">YAML fields for /v1/model/load. Picking a model fills in what would apply to it from its tabby_config.yml and config.yml's use_as_default; values here override both. A model_name here takes precedence over the list.
             <button id="reset-load-options" class="link-button" type="button">Reset to model defaults</button></p>
         </details>

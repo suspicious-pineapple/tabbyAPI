@@ -257,6 +257,13 @@ class ModelConfig(BaseConfigModel):
             f"The legacy values {str(CACHE_SIZES)[15:-1]} are also accepted."
         ),
     )
+    recurrent_state_fp32: Optional[bool] = Field(
+        False,
+        description=(
+            "Store GatedDeltaNet/KDA recurrent state in FP32 instead of FP16. "
+            "Uses twice the state and checkpoint memory; scans compute in FP32 either way."
+        ),
+    )
     tensor_parallel: Optional[bool] = Field(
         False,
         description=(
@@ -678,6 +685,19 @@ class DraftModelConfig(BaseConfigModel):
             "Ceiling is given by num_draft_tokens."
         ),
     )
+    draft_confidence: Optional[float] = Field(
+        0.4,
+        description=(
+            "Target acceptance probability for drafted positions when dynamic_draft is "
+            "enabled (default: 0.4).\n"
+            "Evaluated against an online mapping from drafter confidence scores to "
+            "observed acceptance rates.\n"
+            "Lower values keep longer drafts; higher values truncate more aggressively.\n"
+            "Must be between 0 and 1. Ignored for n-gram drafting."
+        ),
+        gt=0,
+        lt=1,
+    )
     ngram_match_min: Optional[int] = Field(
         2,
         description=(
@@ -693,6 +713,28 @@ class DraftModelConfig(BaseConfigModel):
             "tokens of the earlier continuation in one verification pass (default: 0,\n"
             "off). Works on top of any draft mode, or on its own. Longer values advance\n"
             "more tokens at prefill speed on a hit, and cost a wider verification pass."
+        ),
+        ge=0,
+    )
+    draft_max_rows: Optional[int] = Field(
+        0,
+        description=(
+            "Ceiling on the decoding rows of a speculative round, batch size times\n"
+            "(1 + draft tokens) (default: 0, no ceiling). The draft window shrinks as\n"
+            "the batch grows so that verifying drafts doesn't cost more than drafting\n"
+            "saves at high concurrency."
+        ),
+        ge=0,
+    )
+    sparse_draft_head: Optional[int] = Field(
+        0,
+        description=(
+            "Draft through a dynamic sparse LM head of this many vocabulary columns\n"
+            "(default: 0, full head). Cuts draft latency for MTP and DFlash drafters,\n"
+            "which share the target's head; verification keeps the full head so output\n"
+            "is unaffected. The column set follows the token frequencies seen in\n"
+            "prompts and generations, saved per tokenizer under the user cache\n"
+            "directory. Layer-split loads only; ignored with tensor parallelism."
         ),
         ge=0,
     )

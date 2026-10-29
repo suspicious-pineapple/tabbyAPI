@@ -132,6 +132,10 @@ model:
   # The legacy values 'FP16', 'Q8', 'Q6', 'Q4' are also accepted.
   cache_mode: FP16
 
+  # Store GatedDeltaNet/KDA recurrent state in FP32 instead of FP16 (default: False).
+  # Uses twice the state and checkpoint memory; scans compute in FP32 either way.
+  recurrent_state_fp32: false
+
   # Load model with tensor parallelism.
   # Falls back to autosplit if GPU split isn't provided.
   # This ignores the gpu_split_auto value.
@@ -395,6 +399,12 @@ draft_model:
   # Ceiling is given by num_draft_tokens.
   dynamic_draft:
 
+  # Target acceptance probability for drafted positions when dynamic_draft is enabled
+  # (default: 0.4). Evaluated against an online mapping from drafter confidence scores
+  # to observed acceptance rates. Lower values keep longer drafts; higher values
+  # truncate more aggressively. Must be between 0 and 1. Ignored for n-gram drafting.
+  draft_confidence: 0.4
+
   # Minimum match length for exllamav3 n-gram drafting (default: 2).
   # Only used when draft_mode is ngram.
   ngram_match_min: 2
@@ -405,6 +415,18 @@ draft_model:
   # Longer values advance more tokens at prefill speed on a hit, and cost a wider
   # verification pass.
   hybrid_draft_tokens: 0
+
+  # Ceiling on the decoding rows of a speculative round, batch size times (1 + draft tokens)
+  # (default: 0, no ceiling). The draft window shrinks as the batch grows so that verifying
+  # drafts doesn't cost more than drafting saves at high concurrency.
+  draft_max_rows: 0
+
+  # Draft through a dynamic sparse LM head of this many vocabulary columns (default: 0, full
+  # head). Cuts draft latency for MTP and DFlash drafters, which share the target's head;
+  # verification keeps the full head so output is unaffected. The column set follows the token
+  # frequencies seen in prompts and generations, saved per tokenizer under the user cache
+  # directory. Layer-split loads only; ignored with tensor parallelism.
+  sparse_draft_head: 0
 
 # Options for Sampling
 sampling:

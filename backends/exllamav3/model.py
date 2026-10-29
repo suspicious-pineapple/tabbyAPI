@@ -1,4 +1,5 @@
 import asyncio
+from collections import OrderedDict
 from dataclasses import dataclass
 import gc
 import pathlib
@@ -43,7 +44,11 @@ from common.gen_logging import (
 )
 from common.hardware import hardware_supports_exllamav3, torch_gpu_problem
 from common.health import HealthManager
-from common.errors import ContextLengthExceededError, validate_context_requirements
+from common.errors import (
+    ContextLengthExceededError,
+    LoopDetectedError,
+    validate_context_requirements,
+)
 from common.logger import xlogger
 from common.model_meta import read_model_meta
 from common.multimodal import MultimodalEmbeddingWrapper
@@ -68,6 +73,17 @@ try:
 except:
     print("qlora import failed")
 from backends.exllamav3.chat_jinja import (jinja_renderers, tokenizer_special_tokens, extract_rich_turns, row_template_extras, parse_template_vars)
+
+
+# Recent prompt encodings kept per container. The same text is routinely
+# encoded twice in a row: a streaming request measures its prompt before the
+# response commits to HTTP 200 and then encodes it again for the job, and clients
+# commonly measure a context with /v1/token/encode before sending it. At about
+# a microsecond per token that is half a second twice over for a 500k-token
+# prompt, against a few milliseconds of engine work when the pages are cached.
+# An entry holds the prompt text and its ids (8 bytes per token), so the cache
+# tops out around 100 MB with twenty 500k-token prompts
+ENCODE_CACHE_ENTRIES = 20
 
 
 def _merge_stream_results(results: List[dict]) -> dict:
@@ -232,6 +248,7 @@ class ExllamaV3Container:
     draft_model: Optional[Model] = None
     draft_cache: Optional[Cache] = None
     tokenizer: Optional[Tokenizer] = None
+    bos_token_id: Optional[int] = None
     config: Optional[Config] = None
     draft_config: Optional[Config] = None
     generator: Optional[AsyncGenerator] = None
@@ -247,14 +264,18 @@ class ExllamaV3Container:
     max_seq_len: int = 4096
     cache_size: int = 4096
     cache_mode: str = "FP16"
+    recurrent_state_fp32: bool = False
     draft_cache_mode: str = "FP16"
     chunk_size: int = 2048
     max_rq_tokens: Optional[int] = 2048
     max_batch_size: Optional[int] = None
     draft_num_tokens: Optional[int] = None
     dynamic_draft: Optional[bool] = False
+    draft_confidence: float = 0.4
     ngram_match_min: int = 0
     hybrid_draft_tokens: int = 0
+    draft_max_rows: int = 0
+    sparse_draft_head: int = 0
     recurrent_checkpoint_interval: Optional[int] = None
     recurrent_checkpoint_interval_pp: Optional[int] = None
     # Generator arguments for the persistent disk cache tier, resolved per load
@@ -269,6 +290,7 @@ class ExllamaV3Container:
         self.load_lock = asyncio.Lock()
         self.load_condition = asyncio.Condition()
         self.autosplit_reserve = [96 / 1024]
+        self.encode_cache = OrderedDict()
 
     # Required methods
     @classmethod
@@ -301,7 +323,7 @@ class ExllamaV3Container:
         self = cls()
 
         # Make sure ExllamaV3 is up to date
-        check_package_version("exllamav3", "1.6.1")
+        check_package_version("exllamav3", "1.6.5")
 
         self.model_dir = model_directory
         self.hf_model = hf_model
@@ -314,6 +336,7 @@ class ExllamaV3Container:
         )
         self.model = Model.from_config(self.config)
         self.tokenizer = Tokenizer.from_config(self.config)
+        self.bos_token_id = self.find_bos_token()
 
         # Set CPU offload layers
         self.config.infer_params.moe_cpu_offload = unwrap(kwargs.get("cpu_moe_offload_layers"), 0)
@@ -411,6 +434,9 @@ class ExllamaV3Container:
             else None
         )
         self.dynamic_draft = draft_args.get("dynamic_draft", False)
+        self.draft_confidence = unwrap(draft_args.get("draft_confidence"), 0.4)
+        if not 0.0 < self.draft_confidence < 1.0:
+            raise ValueError("draft_confidence must be between 0 and 1")
 
         # Long suffix-match drafting on top of whichever drafting mode is
         # active, or on its own: a job repeating its own context verbatim gets
@@ -418,6 +444,19 @@ class ExllamaV3Container:
         self.hybrid_draft_tokens = unwrap(draft_args.get("hybrid_draft_tokens"), 0)
         if self.hybrid_draft_tokens < 0:
             raise ValueError("hybrid_draft_tokens must be 0 (off) or greater")
+
+        # Ceiling on the decoding rows of a speculative round, bsz * (1 + draft
+        # tokens): the draft window shrinks as the batch grows so that verifying
+        # the drafts doesn't cost more than the drafting saves
+        self.draft_max_rows = unwrap(draft_args.get("draft_max_rows"), 0)
+        if self.draft_max_rows < 0:
+            raise ValueError("draft_max_rows must be 0 (off) or greater")
+
+        # Draft through a sparse LM head of this many vocabulary columns (MTP and
+        # DFlash drafters share the target's head; verification keeps the full head)
+        self.sparse_draft_head = unwrap(draft_args.get("sparse_draft_head"), 0)
+        if self.sparse_draft_head < 0:
+            raise ValueError("sparse_draft_head must be 0 (off) or greater")
 
         # Always disable draft if params are incorrectly configured
         if draft_mode == "model" and draft_args and draft_model_name is None:
@@ -455,6 +494,14 @@ class ExllamaV3Container:
                 f"Using hybrid drafting: {self.hybrid_draft_tokens} tokens drafted from a "
                 "matching earlier passage of the context."
             )
+        if self.draft_max_rows:
+            xlogger.info(
+                f"Draft windows are trimmed to keep speculative rounds within "
+                f"{self.draft_max_rows} decoding rows (draft_max_rows)."
+            )
+        if self.sparse_draft_head and not self.use_draft_model:
+            xlogger.warning("sparse_draft_head needs a draft model or MTP drafting and is ignored.")
+            self.sparse_draft_head = 0
 
         # Turn off GPU split if the user is using 1 GPU
         gpu_count = torch.cuda.device_count()
@@ -491,6 +538,13 @@ class ExllamaV3Container:
 
                 # TP has its own autosplit loader
                 self.gpu_split_auto = False
+
+                # The sparse drafting head only exists for layer-split loads
+                if self.sparse_draft_head:
+                    xlogger.warning(
+                        "sparse_draft_head is not available in tensor parallel mode and is ignored."
+                    )
+                    self.sparse_draft_head = 0
 
             # Set GPU split options
             # Enable manual GPU split if provided
@@ -599,6 +653,8 @@ class ExllamaV3Container:
         # Create cache
         cache_mode_default = "FP16"
         self.cache_mode = unwrap(kwargs.get("cache_mode"), cache_mode_default)
+        self.recurrent_state_fp32 = unwrap(kwargs.get("recurrent_state_fp32"), False)
+        xlogger.info(f"Recurrent state storage: {'fp32' if self.recurrent_state_fp32 else 'fp16'}")
         self.cache = self.create_cache(self.cache_mode, self.model)
 
         # Draft cache
@@ -893,6 +949,7 @@ class ExllamaV3Container:
         batch_draft_args = {
             "max_batch_size": self.max_batch_size,
             "max_history": max(draft_tokens, self.hybrid_draft_tokens),
+            "recurrent_dtype": torch.float if self.recurrent_state_fp32 else torch.half,
         }
 
         if split_cache_mode:
@@ -940,6 +997,7 @@ class ExllamaV3Container:
             id=self.model_dir.name,
             parameters=model_params,
             meta=read_model_meta(self.model_dir, n_ctx=self.max_seq_len, include_size=True),
+            max_model_len=self.max_seq_len,
         )
 
         return model_card
@@ -955,8 +1013,8 @@ class ExllamaV3Container:
         if not self.generator:
             return
 
-        # Immediately abort all jobs if asked
-        if skip_wait:
+        # Immediately abort all jobs if asked (and say so only if there are any)
+        if skip_wait and self.active_job_ids:
             xlogger.warning(
                 "Immediately terminating all jobs. Clients will have their requests cancelled.\n"
             )
@@ -1206,6 +1264,9 @@ class ExllamaV3Container:
 
         xlogger.info(f"Loading model {self.model_dir} ({split_mode})")
 
+        # The draft model is handed to the main load so the autosplit budgets
+        # for what the drafter reads off the target (DFlash taps hidden states
+        # of several layers, which stay resident on their devices during prefill)
         for value in self.model.load_gen(
             tensor_p=self.use_tp,
             tp_backend=self.tp_backend,
@@ -1214,6 +1275,7 @@ class ExllamaV3Container:
             callback=progress_callback,
             max_chunk_size=self.chunk_size,
             max_batch_size=self.max_batch_size,
+            draft_model=self.draft_model if self.use_draft_model else None,
         ):
             if value:
                 yield value
@@ -1283,8 +1345,11 @@ class ExllamaV3Container:
                 cpu_cache_size=config.memory.sysmem_kv_cache * 1024**2,
                 num_draft_tokens=self.draft_num_tokens,
                 dynamic_draft_tokens=self.dynamic_draft,
+                draft_confidence=self.draft_confidence,
                 ngram_match_min=self.ngram_match_min,
                 hybrid_draft_tokens=self.hybrid_draft_tokens,
+                draft_max_rows=self.draft_max_rows,
+                sparse_draft_head=self.sparse_draft_head,
                 **checkpoint_kwargs,
                 **self.disk_cache_kwargs,
             )
@@ -1390,6 +1455,67 @@ class ExllamaV3Container:
                 async with self.load_condition:
                     self.load_condition.notify_all()
 
+    def find_bos_token(self) -> Optional[int]:
+        """
+        The model's BOS token ID, or None if it has none. When the config files
+        don't name one, the tokenizer falls back to ID 1. That's right for
+        Mistral's <s>, but in GLM's vocabulary (4.7 onwards) it's a quotation
+        mark, so the fallback only counts if it's a special token.
+        """
+
+        bos_id = self.tokenizer.bos_token_id
+        if bos_id is None or self.hf_model.declares_bos_token():
+            return bos_id
+
+        token = self.tokenizer.tokenizer.get_added_tokens_decoder().get(bos_id)
+        return bos_id if token is not None and token.special else None
+
+    def encode_prompt(
+        self,
+        text: str,
+        add_bos: bool,
+        encode_special_tokens: bool = True,
+        embeddings: Optional[list] = None,
+    ) -> torch.Tensor:
+        """
+        Token IDs for a prompt as a (1, n) tensor, from the encode cache when the
+        same text was encoded recently with the same options. The tensor is
+        shared between callers and must not be modified in place (the engine
+        copies it into the job's own buffer). Prompts with multimodal
+        embeddings are never cached: their placeholder IDs belong to the
+        embeddings passed in.
+        """
+
+        if embeddings:
+            return self.tokenizer.encode(
+                text,
+                add_bos=add_bos,
+                encode_special_tokens=encode_special_tokens,
+                embeddings=embeddings,
+            )
+
+        # Containers are also built without __init__ in places
+        cache = getattr(self, "encode_cache", None)
+        if cache is None:
+            cache = self.encode_cache = OrderedDict()
+
+        key = (text, bool(add_bos), bool(encode_special_tokens))
+        ids = cache.get(key)
+        if ids is not None:
+            cache.move_to_end(key)
+            return ids
+
+        ids = self.tokenizer.encode(
+            text,
+            add_bos=add_bos,
+            encode_special_tokens=encode_special_tokens,
+            embeddings=[],
+        )
+        cache[key] = ids
+        while len(cache) > ENCODE_CACHE_ENTRIES:
+            cache.popitem(last=False)
+        return ids
+
     def encode_tokens(self, text: str, **kwargs) -> List[int]:
         """
         Encodes a string of text into a list of token IDs.
@@ -1405,10 +1531,13 @@ class ExllamaV3Container:
         mm_embeddings: MultimodalEmbeddingWrapper = kwargs.get("embeddings")
         mm_embeddings_content = mm_embeddings.content if mm_embeddings else []
 
+        # A model without a BOS token gets none, even if the request asks
+        add_bos_token = unwrap(kwargs.get("add_bos_token"), self.hf_model.add_bos_token())
+
         return (
-            self.tokenizer.encode(
+            self.encode_prompt(
                 text,
-                add_bos=unwrap(kwargs.get("add_bos_token"), self.hf_model.add_bos_token()),
+                add_bos=add_bos_token and self.bos_token_id is not None,
                 encode_special_tokens=unwrap(kwargs.get("encode_special_tokens"), True),
                 embeddings=mm_embeddings_content,
             )
@@ -1447,7 +1576,9 @@ class ExllamaV3Container:
         """
 
         return {
-            "bos_token": self.tokenizer.bos_token if add_bos_token else "",
+            "bos_token": (
+                self.tokenizer.bos_token if add_bos_token and self.bos_token_id is not None else ""
+            ),
             "eos_token": self.tokenizer.eos_token if not ban_eos_token else "",
             "pad_token": self.tokenizer.pad_token,
             "unk_token": self.tokenizer.unk_token,
@@ -1459,30 +1590,18 @@ class ExllamaV3Container:
         params: BaseSamplerRequest,
         mm_embeddings: Optional[MultimodalEmbeddingWrapper] = None,
     ):
-        context_len = len(
-            self.encode_tokens(
-                prompt,
-                add_bos_token=unwrap(params.add_bos_token, self.hf_model.add_bos_token()),
-                embeddings=mm_embeddings,
-            )
-        )
-        max_tokens = unwrap(params.max_tokens, 0)
-        if max_tokens <= 0:
-            max_tokens = self.max_seq_len - context_len - 1
-
-        generator = self.generator.generator
-        allocation_boundary = (
-            generator.recurrent_checkpoint_interval
-            if generator.recurrent_cache is not None
-            else 256
-        )
+        # Only the count is needed, and the encoding is reused by the job
+        add_bos_token = unwrap(params.add_bos_token, self.hf_model.add_bos_token())
+        context_len = self.encode_prompt(
+            prompt,
+            add_bos=add_bos_token and self.bos_token_id is not None,
+            embeddings=mm_embeddings.content if mm_embeddings else [],
+        ).numel()
         validate_context_requirements(
             context_len,
             self.max_seq_len,
-            max_tokens,
             self.cache.max_num_tokens,
-            self.job_max_rq_tokens(max_tokens),
-            allocation_boundary,
+            self.generator.generator.max_draft_tokens,
         )
 
     async def generate(
@@ -1693,7 +1812,11 @@ class ExllamaV3Container:
         # a BOS post-processor (Llama-3 style) prepend BOS regardless of
         # add_bos, which would corrupt the injection
         ids = self.tokenizer.encode(text, encode_special_tokens=True, add_bos=False)
-        if ids.shape[-1] > 0 and ids[0, 0].item() == self.tokenizer.bos_token_id:
+        if (
+            ids.shape[-1] > 0
+            and self.bos_token_id is not None
+            and ids[0, 0].item() == self.bos_token_id
+        ):
             ids = ids[:, 1:]
         if ids.shape[-1] == 0:
             return False
@@ -1757,6 +1880,19 @@ class ExllamaV3Container:
         stop_str = None
         if eos_reason == "max_new_tokens":
             finish_reason = "length"
+        elif eos_reason == "loop_detected":
+            # vLLM's finish_reason for its repetition detector
+            finish_reason = "repetition"
+            xlogger.warning(
+                f"{label}: generation stopped because a token loop was detected",
+                {
+                    "request_id": request_id,
+                    "eos_reason": eos_reason,
+                    "prompt_tokens": result.get("prompt_tokens"),
+                    "gen_tokens": result.get("new_tokens"),
+                    "result": result,
+                },
+            )
         else:
             finish_reason = "stop"
             # Grab stop string if stop was the reason
@@ -1764,17 +1900,6 @@ class ExllamaV3Container:
                 stop_str = result.get("eos_triggering_token_str")
             elif eos_reason == "stop_string":
                 stop_str = result.get("eos_triggering_string")
-            elif eos_reason == "loop_detected":
-                xlogger.warning(
-                    f"{label}: generation stopped because a token loop was detected",
-                    {
-                        "request_id": request_id,
-                        "eos_reason": eos_reason,
-                        "prompt_tokens": result.get("prompt_tokens"),
-                        "gen_tokens": result.get("new_tokens"),
-                        "result": result,
-                    },
-                )
 
         # Prompt
         prompt_tokens = result.get("prompt_tokens")
@@ -1836,6 +1961,18 @@ class ExllamaV3Container:
         tokens = getattr(inner, "cached_tokens", 0) or 0
         sequences = max(len(getattr(inner, "sequences", []) or []), 1)
         return (pages * PAGE_SIZE + tokens) // sequences
+
+    def _job_pending(self, job) -> bool:
+        """
+        Whether a job is in the engine's queue. A requeued job keeps its Job object
+        (prepare_for_requeue reinitializes it in place) and waits there for room to
+        continue. Read on the event loop, the thread the generator iterates on.
+        """
+
+        inner = getattr(job, "job", None)
+        generator = getattr(self.generator, "generator", None)
+        pending = getattr(generator, "pending_jobs", None) or ()
+        return any(j is inner for j in pending)
 
     def _generator_latched(self) -> bool:
         """
@@ -1941,6 +2078,7 @@ class ExllamaV3Container:
         prompts = [prompt]
         stop_conditions = params.stop
         add_bos_token = unwrap(params.add_bos_token, self.hf_model.add_bos_token())
+        add_bos_token = add_bos_token and self.bos_token_id is not None
         grammar_handler = ExLlamaV3Grammar()
 
         # Get multimodal embeddings if present
@@ -1956,7 +2094,7 @@ class ExllamaV3Container:
         stop_conditions = list(set(stop_conditions))
 
         input_ids = [
-            self.tokenizer.encode(
+            self.encode_prompt(
                 prompt,
                 add_bos=add_bos_token,
                 encode_special_tokens=True,
@@ -1974,21 +2112,14 @@ class ExllamaV3Container:
         if max_tokens <= 0:
             max_tokens = self.max_seq_len - context_len - 1
 
-        # Validate the initial job before the generator's page-allocation assertion
+        # Validate the prompt before the generator's page-allocation assertion; the
+        # engine caps the response at the room left in the cache
         max_rq_tokens = self.job_max_rq_tokens(max_tokens)
-        generator = self.generator.generator
-        allocation_boundary = (
-            generator.recurrent_checkpoint_interval
-            if generator.recurrent_cache is not None
-            else 256
-        )
         validate_context_requirements(
             context_len,
             self.max_seq_len,
-            max_tokens,
             self.cache.max_num_tokens,
-            max_rq_tokens,
-            allocation_boundary,
+            self.generator.generator.max_draft_tokens,
         )
 
         # Log prompt to console. Add the BOS token if specified
@@ -2086,6 +2217,8 @@ class ExllamaV3Container:
             settings.append(("logprobs", max(params.logprobs or 0, params.top_logprobs or 0)))
         if params.param_source("loop_detect_window") != "default":
             settings.append(("loop_detect_window", params.loop_detect_window))
+        if params.loop_detect_error and params.get_stop_on_loop():
+            settings.append(("loop_detect_error", True))
 
         settings_text = format_settings(settings, params)
         log_extra = {
@@ -2102,29 +2235,43 @@ class ExllamaV3Container:
         in_reasoning = phases is not None and phases.reasoning
 
         generation = {}
-        job = AsyncJob(
-            self.generator,
-            sampler=reasoning_sampler if in_reasoning else sampler,
-            input_ids=input_ids,
-            max_new_tokens=max_tokens,
-            min_new_tokens=unwrap(params.min_tokens, 0),
-            token_healing=unwrap(params.token_healing, False),
-            decode_special_tokens=True,
-            stop_conditions=stop_conditions,
-            banned_strings=reasoning_banned if in_reasoning else content_banned,
-            embeddings=mm_embeddings_content,
-            return_top_tokens=params.top_logprobs,
-            return_probs=bool(params.logprobs) or bool(params.top_logprobs),
-            max_rq_tokens=max_rq_tokens,
-            stop_on_loop=params.get_stop_on_loop(),
-            filters=([] if in_reasoning and not phases.engine_trigger else grammar_handler.filters),
-        )
+        try:
+            job = AsyncJob(
+                self.generator,
+                sampler=reasoning_sampler if in_reasoning else sampler,
+                input_ids=input_ids,
+                max_new_tokens=max_tokens,
+                min_new_tokens=unwrap(params.min_tokens, 0),
+                token_healing=unwrap(params.token_healing, False),
+                decode_special_tokens=True,
+                stop_conditions=stop_conditions,
+                banned_strings=reasoning_banned if in_reasoning else content_banned,
+                embeddings=mm_embeddings_content,
+                return_top_tokens=params.top_logprobs,
+                return_probs=bool(params.logprobs) or bool(params.top_logprobs),
+                max_rq_tokens=max_rq_tokens,
+                stop_on_loop=params.get_stop_on_loop(),
+                filters=(
+                    [] if in_reasoning and not phases.engine_trigger else grammar_handler.filters
+                ),
+            )
+        except AssertionError as ex:
+            # The engine's own page check; the preflight above mirrors it, but a request
+            # it misses must still reach the client as a context-length error and not
+            # as a generic failure
+            if "cannot be enqueued" not in str(ex):
+                raise
+            raise ContextLengthExceededError(
+                f"{ex}. The request exceeds the available context size "
+                "(this model's maximum context length)."
+            ) from ex
         self.active_job_ids[request_id] = job
         if phases is not None:
             phases.job = job
             self.job_phases[request_id] = phases
         await disconnect_handler.add_cleanup_task(id(job), job.cancel, ())
         job_status = status_display.add_job(request_id, label, context_len)
+        job_status.is_waiting = lambda: self._job_pending(job)
 
         generated_tokens = 0
         full_response = ""
@@ -2147,7 +2294,9 @@ class ExllamaV3Container:
                     job_status.started(prefill_cached_tokens)
                     prefill_start_time = time.time()
                 elif stage == "prefill":
-                    job_status.prefill(result.get("curr_progress", 0))
+                    job_status.prefill(
+                        result.get("curr_progress", 0), result.get("max_progress", 0)
+                    )
                     if return_progress and prefill_start_time is not None:
                         # Time since the engine began prefill for this job. The
                         # started event and the first prefill event often arrive
@@ -2239,12 +2388,23 @@ class ExllamaV3Container:
                     # Save the final result for metrics logging
                     metrics_result = finish_chunk
 
+                    if finish_chunk["finish_reason"] == "repetition" and params.loop_detect_error:
+                        raise LoopDetectedError(
+                            "Generation failed: the model started repeating itself and "
+                            f"loop detection stopped it after {finish_chunk['gen_tokens']} "
+                            "tokens"
+                        )
+
                     yield finish_chunk
                     break
 
         except CancelledError:
             if not job.cancelled:
                 await job.cancel()
+
+        except LoopDetectedError:
+            # The job ended normally in the engine; only the response fails
+            raise
 
         except Exception as ex:
             await self._recover_from_generation_error(ex, job)
@@ -2264,7 +2424,7 @@ class ExllamaV3Container:
             log_generation_params(
                 label,
                 request_id=request_id,
-                bos_token_id=self.tokenizer.bos_token_id,
+                bos_token_id=self.bos_token_id,
                 eos_token_id=eos_tokens,
                 prompt=prompt,
                 **params.model_dump(exclude={"prompt"}),
