@@ -107,9 +107,10 @@ class NetworkConfig(BaseConfigModel):
     web_ui: Optional[bool] = Field(
         True,
         description=(
-            "Serve the built-in chat client at /ui (default: True).\n"
-            "A static page for testing models and settings; it only uses the\n"
-            "regular API, so it does nothing until a browser opens it."
+            "Serve the built-in chat client at /ui and the status page at\n"
+            "/ui/status (default: True). Static pages for testing models and\n"
+            "settings, loading models and watching the server; they only use\n"
+            "the regular API, so they do nothing until a browser opens them."
         ),
     )
 
@@ -152,6 +153,15 @@ class LoggingConfig(BaseConfigModel):
         description=(
             "Prefix console log lines with the time of day (default: True).\n"
             "The log files under logs/ always carry full timestamps."
+        ),
+    )
+    log_auth_keys: Optional[bool] = Field(
+        True,
+        description=(
+            "Print the API and admin keys to the console at startup (default: True).\n"
+            "Set to False to log only how many keys api_tokens.yml holds, for consoles\n"
+            "or log files that others can read. The web UI links printed at startup\n"
+            "then leave out the admin key as well."
         ),
     )
     log_chat_completion_requests: Optional[bool] = Field(
