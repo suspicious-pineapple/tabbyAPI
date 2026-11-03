@@ -30,6 +30,7 @@ from common.networking import (
 )
 from common.utils import unwrap
 from endpoints.OAI.types.chat_completion import (
+    REASONING_FIELDS,
     ChatCompletionLogprobs,
     ChatCompletionMessage,
     ChatCompletionMessagePart,
@@ -42,6 +43,7 @@ from endpoints.OAI.utils.completion import _gen_label, _parse_gen_request_id
 from endpoints.OAI.utils.stream_parser import (
     CONTENT,
     REASONING,
+    ChannelStreamParser,
     GlimmerStreamParser,
     HarmonyStreamParser,
     TagStreamParser,
@@ -113,16 +115,42 @@ def _user_suffix_len(data: ChatCompletionRequest) -> int:
     return suffix_len
 
 
+def _continued_field(data: ChatCompletionRequest) -> Optional[str]:
+    """
+    The field of the final message that a request continues, "content" or
+    "reasoning_content", or None if it continues nothing.
+    """
+
+    mode = data.continue_final_message
+    if not mode or not data.messages:
+        return None
+
+    if mode is True:
+        final_message = data.messages[-1]
+        if final_message.reasoning_content and not final_message.content:
+            if final_message.role == "assistant":
+                return "reasoning_content"
+        return "content"
+
+    return "reasoning_content" if mode in REASONING_FIELDS else mode
+
+
 def _resolve_start_in_reasoning(prompt: str, data: ChatCompletionRequest) -> bool:
     """Determine whether generation starts inside a reasoning block."""
 
     mc = model.container
     if mc.harmony or mc.muse_glimmer:
         # Harmony and Glimmer message headers determine the channel; there
-        # is no ambiguity for the parser to resolve
-        return False
+        # is no ambiguity for the parser to resolve, except for a continued
+        # message, whose header is in the prompt
+        return _continued_field(data) == "reasoning_content"
     if not mc.reasoning:
         return False
+
+    if _continued_field(data) == "reasoning_content":
+        # The prompt was cut inside the block; only a response prefix can leave it
+        prefix = data.response_prefix or ""
+        return prefix.rfind(mc.reasoning_start_token) >= prefix.rfind(mc.reasoning_end_token)
 
     mode = mc.start_in_reasoning
     if mode == "always":
@@ -320,6 +348,24 @@ def _sort_tool_messages(message_dicts: List[dict]):
             message_dicts[run_start:i] = run
 
 
+def _expose_reasoning(message: dict):
+    """
+    Give an assistant message's reasoning every name a chat template may read
+    it under: Qwen's read reasoning_content, Laguna's reasoning, gpt-oss's thinking.
+    """
+
+    reasoning = message.get("reasoning_content")
+    if message["role"] != "assistant" or not reasoning:
+        return
+
+    message.update(dict.fromkeys(REASONING_FIELDS, reasoning))
+
+    # Harmony renders either as a tool call's analysis message, and gpt-oss's
+    # template raises if given both. llama.cpp keeps the reasoning too.
+    if model.container.harmony and message.get("tool_calls"):
+        message.pop("content", None)
+
+
 async def format_messages_with_template(
     messages: List[ChatCompletionMessage],
     existing_template_vars: Optional[dict] = None,
@@ -344,7 +390,9 @@ async def format_messages_with_template(
             # Convert the message content into a concatenated string
             message.content = concatenated_content
 
-        message_dicts.append(message.model_dump(exclude_none=True))
+        message_dict = message.model_dump(exclude_none=True)
+        _expose_reasoning(message_dict)
+        message_dicts.append(message_dict)
 
     # Pre-template: convert tool_call arguments from JSON strings to dicts.
     # OpenAI-compatible clients (Kilo, Roo, etc.) send arguments as JSON
@@ -407,7 +455,22 @@ def _mark_continued_final_message(data: ChatCompletionRequest) -> str:
 
     final_message = data.messages[-1].model_copy(deep=True)
 
-    if isinstance(final_message.content, str):
+    if final_message.tool_calls:
+        raise request_error("continue_final_message can't continue a message with tool calls")
+
+    if _continued_field(data) == "reasoning_content":
+        if final_message.role != "assistant":
+            raise request_error("Only an assistant message has reasoning to continue")
+        if final_message.reasoning_content is None:
+            raise request_error(
+                "continue_final_message is set but the final message has no reasoning to continue"
+            )
+        final_text = final_message.reasoning_content
+        final_message.reasoning_content = final_text + CONTINUE_FINAL_MESSAGE_TAG
+
+        # Templates expect content, which a reply cut off during reasoning doesn't have
+        final_message.content = final_message.content or ""
+    elif isinstance(final_message.content, str):
         final_text = final_message.content
         final_message.content = final_message.content + CONTINUE_FINAL_MESSAGE_TAG
     elif isinstance(final_message.content, list):
@@ -431,6 +494,30 @@ def _mark_continued_final_message(data: ChatCompletionRequest) -> str:
 
     data.messages = data.messages[:-1] + [final_message]
     return final_text
+
+
+async def _open_reasoning_block(data: ChatCompletionRequest, reasoning: str):
+    """
+    Prompt for continuing reasoning that the template doesn't render, as
+    Gemma 4's strips it: the generation prompt, with the reasoning block opened
+    here as llama.cpp does. Returns the same as format_messages_with_template.
+    """
+
+    start_token = model.container.reasoning_start_token
+    end_token = model.container.reasoning_end_token
+
+    prompt, mm_embeddings, template_vars = await format_messages_with_template(
+        data.messages[:-1], {**data.template_vars, "add_generation_prompt": True}
+    )
+
+    # The generation prompt may open the block itself, or open and close it to
+    # skip reasoning
+    start = prompt.rfind(start_token)
+    if start != -1 and prompt[start + len(start_token) :].strip() in ("", end_token):
+        prompt = prompt[:start]
+
+    separator = "" if reasoning[:1].isspace() else "\n"
+    return prompt + start_token + separator + reasoning, mm_embeddings, template_vars
 
 
 def _cut_prompt_at_continue_tag(prompt: str, final_message_text: str) -> str:
@@ -458,12 +545,23 @@ def _cut_prompt_at_continue_tag(prompt: str, final_message_text: str) -> str:
     return prompt[:tag_loc].rstrip()
 
 
+# What templates call keeping reasoning on turns before the last user message.
+# llama.cpp sets the same four by default.
+PRESERVE_REASONING_VARS = {
+    "preserve_thinking": True,
+    "clear_thinking": False,
+    "truncate_history_thinking": False,
+    "drop_thinking": False,
+}
+
+
 def resolve_template_vars(data: ChatCompletionRequest, container) -> dict:
     """
     Merge chat template variables from all sources. Priority, lowest to
-    highest: the model's template_vars_default, the request's reasoning
-    object, the request's flat reasoning_effort/enable_thinking/verbosity
-    fields, the request's template_vars, then the model's template_vars_force.
+    highest: PRESERVE_REASONING_VARS if there's reasoning to preserve, the
+    model's template_vars_default, the request's reasoning object, the
+    request's flat reasoning_effort/enable_thinking/verbosity fields, the
+    request's template_vars, then the model's template_vars_force.
     """
 
     request_vars = {}
@@ -486,7 +584,12 @@ def resolve_template_vars(data: ChatCompletionRequest, container) -> dict:
 
     request_vars.update(data.template_vars)
 
+    # With no reasoning to keep, these would only give earlier turns empty
+    # reasoning blocks, as Qwen 3.6's and DeepSeek V4's templates do
+    has_reasoning = any(message.reasoning_content for message in data.messages)
+
     return {
+        **(PRESERVE_REASONING_VARS if has_reasoning else {}),
         **container.template_vars_default,
         **request_vars,
         **container.template_vars_force,
@@ -532,12 +635,22 @@ async def apply_chat_template(data: ChatCompletionRequest):
             original_final_message = data.messages[-1] if data.messages else None
             continued_message_text = _mark_continued_final_message(data)
 
+        continues_reasoning = _continued_field(data) == "reasoning_content"
         prompt, mm_embeddings, template_vars = await format_messages_with_template(
             data.messages, data.template_vars
         )
 
         if continued_message_text is not None:
-            prompt = _cut_prompt_at_continue_tag(prompt, continued_message_text)
+            if (
+                continues_reasoning
+                and model.container.reasoning
+                and CONTINUE_FINAL_MESSAGE_TAG.strip() not in prompt
+            ):
+                prompt, mm_embeddings, template_vars = await _open_reasoning_block(
+                    data, continued_message_text
+                )
+            else:
+                prompt = _cut_prompt_at_continue_tag(prompt, continued_message_text)
 
             # Restore the caller's final message so request logs and dumps
             # don't show the sentinel tag
@@ -680,17 +793,22 @@ async def _chat_stream_collector(
     full_content = ""
     full_tool = ""
 
+    # A continued message is left open by the prompt, its header already passed
+    initial_channel = None
+    if params.continue_final_message:
+        initial_channel = REASONING if start_in_reasoning_mode else CONTENT
+
     if mc.harmony:
         # Harmony messages carry their own channel structure, superseding the
         # reasoning and tool format settings
         tool_format = "harmony"
         use_think = False
-        parser = HarmonyStreamParser()
+        parser = HarmonyStreamParser(initial_channel)
     elif mc.muse_glimmer:
         # Same for Muse Glimmer, with recipients in place of channels
         tool_format = "muse_glimmer"
         use_think = False
-        parser = GlimmerStreamParser()
+        parser = GlimmerStreamParser(initial_channel)
     else:
         tool_format = mc.tool_format
         t_tool_start, t_tool_end = get_toolcall_tags(tool_format)
@@ -719,12 +837,20 @@ async def _chat_stream_collector(
             xlogger.debug(
                 "A reasoning budget was requested but the model has no reasoning format; ignoring."
             )
+    # Reasoning continued from the request counts as spent, as in llama.cpp
     reasoning_tokens = 0
+    if budget_injection is not None and _continued_field(params) == "reasoning_content":
+        reasoning_tokens = len(mc.encode_tokens(params.messages[-1].reasoning_content or ""))
 
     # The backend holds one set of sampler settings for reasoning and one for
     # content (which alone carries any grammar); it's told here when the
     # response moves between the two
     phase_applied = parser.in_reasoning
+
+    # With messages to get through first, any grammar waits for the content's
+    channel_parser = None
+    if isinstance(parser, ChannelStreamParser) and not parser.in_content:
+        channel_parser = parser
 
     # A JSON answer may be preceded by the blank line models put after their
     # reasoning (the grammar allows it); the client gets the JSON alone
@@ -741,6 +867,7 @@ async def _chat_stream_collector(
             disconnect_handler,
             mm_embeddings,
             reasoning_phase=phase_applied,
+            channel_parser=channel_parser,
             label=label,
         )
         generation = {"index": task_idx}

@@ -95,6 +95,15 @@ class NetworkConfig(BaseConfigModel):
         ),
         ge=0,
     )
+    enable_metrics: Optional[bool] = Field(
+        False,
+        description=(
+            "Enable the Prometheus-compatible /metrics endpoint (default: False).\n"
+            "Exposes aggregate inference stats in the text exposition format,\n"
+            "with the same names as llama.cpp's under a tabbyapi: prefix.\n"
+            "Requires an API key unless disable_auth is set."
+        ),
+    )
     access_log: Optional[bool] = Field(
         False,
         description=(
