@@ -1,4 +1,4 @@
-from pydantic import AliasChoices, BaseModel, Field, field_validator
+from pydantic import AliasChoices, BaseModel, Field, field_validator, model_validator
 from time import time
 from typing import Literal, Union, List, Optional, Dict
 from uuid import uuid4
@@ -34,12 +34,32 @@ class ChatCompletionMessagePart(BaseModel):
     image_url: Optional[ChatCompletionImageUrl] = None
 
 
+# The names a message's reasoning goes by, the first being the one used here.
+# vLLM and transformers also take it under the others.
+REASONING_FIELDS = ("reasoning_content", "reasoning", "thinking")
+
+
 class ChatCompletionMessage(BaseModel):
     role: str = "user"
     content: Optional[Union[str, List[ChatCompletionMessagePart]]] = None
-    reasoning_content: Optional[str] = None
+    reasoning_content: Optional[str] = Field(
+        default=None, validation_alias=AliasChoices(*REASONING_FIELDS)
+    )
     tool_calls: Optional[List[ToolCall]] = None
     tool_call_id: Optional[str] = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def use_filled_reasoning_field(cls, data):
+        """Don't let a null or empty name hide the reasoning sent under another."""
+
+        if isinstance(data, dict):
+            for name in REASONING_FIELDS:
+                value = data.get(name)
+                if value and isinstance(value, str):
+                    return {**data, "reasoning_content": value}
+
+        return data
 
 
 class ChatCompletionRespChoice(BaseModel):
@@ -146,7 +166,16 @@ class ChatCompletionRequest(CommonCompletionRequest):
     )
     response_prefix: Optional[str] = None
 
-    continue_final_message: Optional[bool] = False
+    continue_final_message: Optional[
+        Union[bool, Literal["content", "reasoning_content", "reasoning", "thinking"]]
+    ] = Field(
+        default=False,
+        description=(
+            "Continue the final message instead of starting a new one. true continues "
+            "its reasoning if it has reasoning and no content, otherwise its content; "
+            "naming a field continues that field."
+        ),
+    )
     model: Optional[str] = None
 
     # tools is follows the format OAI schema, functions is more flexible

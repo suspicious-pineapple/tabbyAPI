@@ -50,6 +50,11 @@ network:
   # Generation requests are already logged in detail; this adds the rest, such as model list and health polls.
   access_log: false
 
+  # Serve a Prometheus-compatible /metrics endpoint (default: False).
+  # Metric names follow llama.cpp's under a tabbyapi: prefix, and the token counters move
+  # during a generation. Requires an API key unless disable_auth is set.
+  enable_metrics: false
+
   # Serve the built-in chat client at /ui and the status page at
   # /ui/status (default: True). Static pages for testing models and
   # settings, loading models and watching the server; they only use

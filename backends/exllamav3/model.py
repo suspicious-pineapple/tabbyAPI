@@ -29,9 +29,14 @@ from exllamav3 import (
 from exllamav3.model.lora import LoRA
 from exllamav3.model.lora import Linear
 from exllamav3.cache import CacheLayer_quant
-from backends.exllamav3.grammar import ExLlamaV3Grammar
+from backends.exllamav3.grammar import ExLlamaV3Grammar, MessageGate
 
-from backends.exllamav3.sampler import ExllamaV3SamplerBuilder
+from backends.exllamav3.sampler import (
+    ExllamaV3SamplerBuilder,
+    SS_Candidates,
+    SS_HealedCandidates,
+    SS_OnlyPath,
+)
 from backends.exllamav3.utils import exllama_supports_nccl
 from backends.exllamav3.vision import clear_image_embedding_cache, image_embedding_cache
 from common.concurrency import iterate_in_threadpool
@@ -46,10 +51,12 @@ from common.hardware import hardware_supports_exllamav3, torch_gpu_problem
 from common.health import HealthManager
 from common.errors import (
     ContextLengthExceededError,
+    EmptyPromptError,
     LoopDetectedError,
     validate_context_requirements,
 )
 from common.logger import xlogger
+from common.metrics import MetricsManager
 from common.model_meta import read_model_meta
 from common.multimodal import MultimodalEmbeddingWrapper
 from common.networking import DisconnectHandler
@@ -129,6 +136,10 @@ class JobPhases:
     # from here lands a few tokens late (see set_generation_phase)
     engine_trigger: bool = False
 
+    # The content filters are on the job already, and open themselves on the
+    # header of the first content message (see GatedFilter)
+    gated: bool = False
+
     def differ(self) -> bool:
         return bool(
             self.content_filters
@@ -204,6 +215,23 @@ def _describe_reasoning_settings(reasoning_params: BaseSamplerRequest) -> str:
             value = f"{len(value)} {unit}"
         parts.append(f"{name}: {value} ({source})")
     return ", ".join(parts)
+
+
+class JobGroup:
+    """The jobs of a single request, cancelled together."""
+
+    def __init__(self):
+        self.jobs = []
+        self.cancelled = False
+
+    def add(self, job):
+        self.jobs.append(job)
+
+    async def cancel(self):
+        self.cancelled = True
+        for job in self.jobs:
+            if not job.cancelled:
+                await job.cancel()
 
 
 class ExllamaV3Container:
@@ -318,7 +346,7 @@ class ExllamaV3Container:
         self = cls()
 
         # Make sure ExllamaV3 is up to date
-        check_package_version("exllamav3", "1.6.5")
+        check_package_version("exllamav3", "1.6.6")
 
         self.model_dir = model_directory
         self.hf_model = hf_model
@@ -1544,6 +1572,11 @@ class ExllamaV3Container:
             add_bos=add_bos_token and self.bos_token_id is not None,
             embeddings=mm_embeddings.content if mm_embeddings else [],
         ).numel()
+        if context_len == 0:
+            raise EmptyPromptError(
+                "The prompt is empty, and this model doesn't start with a BOS token, "
+                "so there is nothing to generate from."
+            )
         validate_context_requirements(
             context_len,
             self.max_seq_len,
@@ -1626,6 +1659,7 @@ class ExllamaV3Container:
         disconnect_handler: DisconnectHandler = None,
         mm_embeddings: Optional[MultimodalEmbeddingWrapper] = None,
         reasoning_phase: Optional[bool] = None,
+        channel_parser=None,
         label: Optional[str] = None,
     ) -> AsyncIterator[Dict[str, Any]]:
         """
@@ -1643,6 +1677,9 @@ class ExllamaV3Container:
                 reasoning overrides apply and grammar filters are off. None
                 (default) for callers that don't: one set of settings and
                 filters from the first token.
+            channel_parser: The caller's ChannelStreamParser, for a response
+                of headed messages that has yet to reach its content, where
+                grammar filters wait for the first content message.
             label: Short name for the request in console logs.
 
         Yields:
@@ -1672,12 +1709,309 @@ class ExllamaV3Container:
                 disconnect_handler=disconnect_handler,
                 mm_embeddings=mm_embeddings,
                 reasoning_phase=reasoning_phase,
+                channel_parser=channel_parser,
                 label=label,
             ):
                 yield generation_chunk
         finally:
             # Clean up and remove the job from active IDs
             del self.active_job_ids[request_id]
+
+    async def _explore_job(
+        self,
+        jobs: "JobGroup",
+        input_ids: torch.Tensor,
+        sampler,
+        max_new_tokens: int,
+        stop_conditions: List[int],
+        disconnect_handler: DisconnectHandler,
+        job_status=None,
+        token_healing: bool = False,
+    ) -> Optional[dict]:
+        """Runs a job to its end, returning its last result, or None if it was cancelled."""
+
+        try:
+            job = AsyncJob(
+                self.generator,
+                sampler=sampler,
+                input_ids=input_ids,
+                max_new_tokens=max_new_tokens,
+                decode_special_tokens=True,
+                stop_conditions=stop_conditions,
+                token_healing=token_healing,
+                max_rq_tokens=self.job_max_rq_tokens(max_new_tokens),
+            )
+        except AssertionError as ex:
+            if "cannot be enqueued" not in str(ex):
+                raise
+            raise ContextLengthExceededError(
+                f"{ex}. The request exceeds the available context size."
+            ) from ex
+
+        jobs.add(job)
+        await disconnect_handler.add_cleanup_task(id(job), job.cancel, ())
+
+        async for result in job:
+            await disconnect_handler.poll()
+
+            if job_status is not None:
+                stage = result.get("stage")
+                if stage == "started":
+                    job_status.started(self._job_cached_tokens(job))
+                elif stage == "prefill":
+                    job_status.prefill(
+                        result.get("curr_progress", 0), result.get("max_progress", 0)
+                    )
+
+            if result.get("eos"):
+                await disconnect_handler.finish(id(job))
+                return result
+
+        return None
+
+    async def explore_continuations(
+        self,
+        request_id: str,
+        prompt: str,
+        params: BaseSamplerRequest,
+        max_options: int,
+        max_branch_tokens: int,
+        disconnect_handler: DisconnectHandler,
+        label: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """
+        Finds the ways a prompt can go on under the request's sampler settings. One job
+        finds the tokens that pass truncation next, then one job per token follows it for
+        as long as a single token keeps passing. Their shared prompt is deduplicated by
+        the page cache, so only what differs is processed. Stop strings and banned strings
+        take no part: this shows what the sampler allows.
+
+        With token healing the prompt's last token is sampled again first, limited to
+        tokens that start with it. Those that extend it are options, with its place in
+        the prompt taken by the longer token. If it can also stay as it is, that isn't an
+        option itself but leads to the tokens after it, which share its probability. So
+        each option's probability is still that of a generation starting with its text.
+
+        Returns the fields of a ContinuationsResponse.
+        """
+
+        label = label or f"request {request_id}"
+        started_at = time.time()
+
+        async with self.load_condition:
+            await self.load_condition.wait_for(lambda: not self.load_lock.locked())
+        if not self.loaded:
+            raise RuntimeError("Model is being unloaded. Cannot process new generation requests.")
+
+        add_bos_token = unwrap(params.add_bos_token, self.hf_model.add_bos_token())
+        input_ids = self.encode_prompt(
+            prompt,
+            add_bos=add_bos_token and self.bos_token_id is not None,
+            encode_special_tokens=True,
+            embeddings=[],
+        )
+        context_len = input_ids.size(dim=-1)
+        validate_context_requirements(
+            context_len,
+            self.max_seq_len,
+            self.cache.max_num_tokens,
+            self.generator.generator.max_draft_tokens,
+        )
+        room = self.max_seq_len - context_len - 1
+        if room < 1:
+            raise ContextLengthExceededError(
+                f"The prompt fills the context ({context_len} of {self.max_seq_len} tokens)."
+            )
+
+        greedy = params.temperature == 0
+        builder = ExllamaV3SamplerBuilder.from_params(params, self.tokenizer, self.max_seq_len)
+        truncated = greedy or any(
+            name in ("min_p", "top_k", "top_p") for name, _ in builder.settings
+        )
+        settings_text = format_settings(list(builder.settings), params)
+        log_request_start(
+            label,
+            context_len,
+            settings_text,
+            {"request_id": request_id, "prompt_tokens": context_len},
+        )
+
+        eos_tokens = self.hf_model.eos_tokens() or [self.tokenizer.eos_token_id]
+        stop_tokens = {*eos_tokens, *self.config.eos_token_id_list}
+        healing = unwrap(params.token_healing, False) and self._can_heal(input_ids, stop_tokens)
+        # Ends a path at a branch point. Any token that doesn't end generations will do
+        # as a path can only reach it by way of being the single token to pass
+        branch_token = next(
+            token
+            for token in range(self.tokenizer.actual_vocab_size - 1, -1, -1)
+            if token not in stop_tokens
+        )
+        stop_conditions = [*stop_tokens, branch_token]
+
+        def decode(ids: List[int]) -> str:
+            return self.decode_tokens(ids, decode_special_tokens=True) if ids else ""
+
+        # Decoding alone can drop what a tokenizer leaves off the start of a text
+        context = input_ids[0, -SS_OnlyPath.TAIL :].tolist()
+
+        def span_text(ids: List[int], replaces_last: bool = False) -> str:
+            base = context[:-1] if replaces_last else context
+            return decode(base + ids)[len(decode(context)) :]
+
+        jobs = JobGroup()
+        self.active_job_ids[request_id] = jobs
+        job_status = status_display.add_job(request_id, label, context_len)
+        job_status.is_waiting = lambda: bool(jobs.jobs) and all(map(self._job_pending, jobs.jobs))
+        job_status.prompt = prompt
+
+        async def cancel_from_status():
+            job_status.cancel_requested = True
+            await jobs.cancel()
+
+        job_status.cancel = cancel_from_status
+
+        options = []
+        generated_tokens = 0
+        cached_tokens = 0
+        passing = 0
+        tasks = []
+
+        try:
+            found = (
+                SS_HealedCandidates(max_options, input_ids[0, -1].item(), branch_token)
+                if healing
+                else SS_Candidates(max_options)
+            )
+            result = await self._explore_job(
+                jobs,
+                input_ids,
+                builder.build_explorer(greedy, found),
+                1,
+                stop_conditions,
+                disconnect_handler,
+                job_status,
+                token_healing=healing,
+            )
+            if result is not None:
+                cached_tokens = round(result.get("cached_tokens") or 0)
+                generated_tokens += 1
+                job_status.generated(generated_tokens)
+
+            # (token, probability, whether it takes the place of the last token)
+            candidates = []
+            passing = found.count
+            if healing:
+                stays = 0.0
+                for token, prob in found.candidates or []:
+                    if token == found.last_token:
+                        stays = prob
+                        passing -= 1
+                    else:
+                        candidates.append((token, prob, True))
+                if stays > 0.0:
+                    passing += found.following_count
+                    candidates += [
+                        (token, prob * stays, False) for token, prob in found.following or []
+                    ]
+            else:
+                candidates = [(token, prob, False) for token, prob in found.candidates or []]
+
+            candidates = sorted(candidates, key=lambda c: c[1], reverse=True)[:max_options]
+
+            limit = min(max_branch_tokens, room)
+            paths = []
+            for token, _, replaces_last in candidates:
+                base_ids = input_ids[:, :-1] if replaces_last else input_ids
+                path = SS_OnlyPath(base_ids.size(dim=-1), limit, branch_token, decode)
+                path.span = [token]
+                paths.append(path)
+
+                # Leaves room to finish an incomplete character
+                extra_tokens = min(limit - 1 + SS_OnlyPath.TAIL, room - 1)
+                if token in stop_tokens:
+                    path.end = "stop"
+                elif extra_tokens < 1 or (limit == 1 and not decode([token]).endswith("\ufffd")):
+                    path.end = "limit"
+                else:
+                    extended = torch.cat(
+                        (base_ids, torch.tensor([[token]], dtype=input_ids.dtype)), dim=-1
+                    )
+                    sampler = ExllamaV3SamplerBuilder.from_params(
+                        params, self.tokenizer, self.max_seq_len
+                    ).build_explorer(greedy, path)
+                    tasks.append(
+                        asyncio.create_task(
+                            self._follow_path(
+                                jobs,
+                                extended,
+                                sampler,
+                                path,
+                                extra_tokens,
+                                stop_conditions,
+                                disconnect_handler,
+                            )
+                        )
+                    )
+
+            await asyncio.gather(*tasks)
+
+            for (token, prob, replaces_last), path in zip(candidates, paths, strict=True):
+                text = span_text(path.span, replaces_last)
+                options.append(
+                    {
+                        "text": text,
+                        "first": span_text([token], replaces_last).removesuffix("\ufffd"),
+                        "token_ids": path.span,
+                        "healed": replaces_last,
+                        "prob": prob,
+                        "end": path.end or "limit",
+                    }
+                )
+                generated_tokens += len(path.span) - 1
+                job_status.append_text(text + "\n")
+            job_status.generated(generated_tokens)
+            job_status.finish_reason = "abort" if job_status.cancel_requested else "stop"
+
+        except CancelledError:
+            for task in tasks:
+                task.cancel()
+            await jobs.cancel()
+            raise
+
+        except Exception as ex:
+            for task in tasks:
+                task.cancel()
+            await self._recover_from_generation_error(ex, jobs)
+            raise
+
+        finally:
+            status_display.remove_job(request_id)
+            self.active_job_ids.pop(request_id, None)
+
+        elapsed = time.time() - started_at
+        xlogger.info(
+            f"{label}: {len(options)} options, {generated_tokens} tokens in {elapsed:.2f} s",
+            {"request_id": request_id, "options": len(options)},
+        )
+
+        return {
+            "options": options,
+            "candidates": passing,
+            "truncated": truncated,
+            "prompt_tokens": context_len,
+            "cached_tokens": cached_tokens,
+            "generated_tokens": generated_tokens,
+            "time": elapsed,
+        }
+
+    async def _follow_path(
+        self, jobs, input_ids, sampler, path, max_new_tokens, stop_conditions, disconnect_handler
+    ):
+        result = await self._explore_job(
+            jobs, input_ids, sampler, max_new_tokens, stop_conditions, disconnect_handler
+        )
+        if path.end is None and result is not None:
+            path.end = "stop" if result.get("eos_reason") == "stop_token" else "limit"
 
     def set_generation_phase(self, request_id: str, reasoning: bool) -> bool:
         """
@@ -1704,7 +2038,10 @@ class ExllamaV3Container:
             # A forced-output injection (reasoning budget) switches a job's
             # filters off, trigger included, so they have to be set again
             suspended = getattr(getattr(job, "job", None), "filters_suspended", False)
-            if phases.engine_trigger and not reasoning and not suspended:
+            if phases.gated and not suspended:
+                # They're watching the headers, through any number of messages
+                pass
+            elif phases.engine_trigger and not reasoning and not suspended:
                 # The engine armed them itself when it sampled the end tag
                 phases.engine_trigger = False
             else:
@@ -1713,6 +2050,7 @@ class ExllamaV3Container:
                 for content_filter in phases.content_filters:
                     content_filter.trigger_token = None
                 phases.engine_trigger = False
+                phases.gated = False
                 try:
                     job.set_filters([] if reasoning else phases.content_filters)
                 except ValueError:
@@ -1738,21 +2076,11 @@ class ExllamaV3Container:
         Force `text` into the output stream of an active generation job: the
         next sampled tokens are constrained to the given string, then sampling
         resumes. Used to end the reasoning phase when a reasoning budget is
-        exhausted. Returns False if the job is not running or the installed
-        exllamav3 version does not support output constraints.
+        exhausted. Returns False if the job is not running.
         """
 
         job = self.active_job_ids.get(request_id)
         if job is None:
-            return False
-
-        # TODO: Call directly once the minimum exllamav3 version requirement
-        #       includes AsyncJob.constrain_output_now
-        if not hasattr(job, "constrain_output_now"):
-            xlogger.warning(
-                "The installed exllamav3 version does not support output "
-                "constraints; the reasoning budget is ignored."
-            )
             return False
 
         # Encode here rather than passing the string through: tokenizers with
@@ -1903,6 +2231,35 @@ class ExllamaV3Container:
         return finish_chunk
 
     @staticmethod
+    def _can_heal(input_ids: torch.Tensor, stop_conditions) -> bool:
+        """
+        Whether a prompt's last token can be healed. A stop token can't be: it's the one
+        token that starts with itself, so healing would sample it again and end the
+        generation before it started.
+        """
+
+        return input_ids[0, -1].item() not in stop_conditions
+
+    @staticmethod
+    def _job_times(job) -> dict:
+        """Time so far in each phase of a job the engine won't report on, as it was cancelled."""
+
+        inner = getattr(job, "job", None)
+        enqueued = getattr(inner, "time_enqueue", None)
+        first_prefill = getattr(inner, "time_first_prefill", None)
+        first_token = getattr(inner, "time_first_token", None)
+
+        def phase(start, end):
+            return end - start if start is not None and end is not None else 0.0
+
+        # The totals carry the time before a requeue, if there was one
+        return {
+            "time_enqueued": getattr(inner, "time_enqueued", 0.0) + phase(enqueued, first_prefill),
+            "time_prefill": getattr(inner, "time_prefill", 0.0) + phase(first_prefill, first_token),
+            "time_generate": getattr(inner, "time_generate", 0.0) + phase(first_token, time.time()),
+        }
+
+    @staticmethod
     def _job_cached_tokens(job) -> int:
         """Prompt tokens an enqueued job reused from the cache (whole pages plus a partial page)."""
 
@@ -1985,6 +2342,7 @@ class ExllamaV3Container:
         disconnect_handler: DisconnectHandler = None,
         mm_embeddings: Optional[MultimodalEmbeddingWrapper] = None,
         reasoning_phase: Optional[bool] = None,
+        channel_parser=None,
         label: Optional[str] = None,
     ):
         """
@@ -2082,9 +2440,19 @@ class ExllamaV3Container:
         # reasoning they come into force when the content begins: armed by the
         # engine on the end-of-reasoning token if the tag is one token, else
         # swapped in by set_generation_phase. Otherwise from the first token
+        # Formats made of headed messages have no such tag, and the filters
+        # open on the header of the first content message instead
         trigger_token_id = None
         constrained = params.json_schema or params.regex_pattern or params.grammar_string
-        if constrained and reasoning_phase and getattr(self, "reasoning", False):
+        if constrained and channel_parser:
+            grammar_handler.gate = MessageGate(
+                message_token=self.tokenizer.single_id("<|message|>"),
+                boundary_tokens=frozenset(
+                    self.tokenizer.single_id(token) for token in channel_parser.structural_tokens
+                ),
+                opens_content=channel_parser.opens_content,
+            )
+        elif constrained and reasoning_phase and getattr(self, "reasoning", False):
             if self.reasoning_end_token:
                 trigger_token_id = self.tokenizer.single_id(self.reasoning_end_token)
 
@@ -2094,7 +2462,7 @@ class ExllamaV3Container:
                 params.json_schema,
                 self.tokenizer,
                 trigger_token_id=trigger_token_id,
-                allow_leading_whitespace=bool(reasoning_phase),
+                allow_leading_whitespace=bool(reasoning_phase and not grammar_handler.gate),
             )
 
         if params.regex_pattern:
@@ -2123,6 +2491,7 @@ class ExllamaV3Container:
                 content_filters=list(grammar_handler.filters),
                 reasoning=reasoning_phase,
                 engine_trigger=trigger_token_id is not None,
+                gated=grammar_handler.gate is not None,
             )
             if not phases.differ():
                 phases = None
@@ -2165,9 +2534,9 @@ class ExllamaV3Container:
             settings.append(("token_healing", True))
         if params.logprobs or params.top_logprobs:
             settings.append(("logprobs", max(params.logprobs or 0, params.top_logprobs or 0)))
-        if params.param_source("loop_detect_window") != "default":
-            settings.append(("loop_detect_window", params.loop_detect_window))
-        if params.loop_detect_error and params.get_stop_on_loop():
+        if params.param_source("loop_detect") != "default":
+            settings.append(("loop_detect", params.loop_detect))
+        if params.loop_detect_error and params.loop_detect:
             settings.append(("loop_detect_error", True))
 
         settings_text = format_settings(settings, params)
@@ -2192,7 +2561,10 @@ class ExllamaV3Container:
                 input_ids=input_ids,
                 max_new_tokens=max_tokens,
                 min_new_tokens=unwrap(params.min_tokens, 0),
-                token_healing=unwrap(params.token_healing, False),
+                token_healing=(
+                    unwrap(params.token_healing, False)
+                    and self._can_heal(input_ids[0], stop_conditions)
+                ),
                 decode_special_tokens=True,
                 stop_conditions=stop_conditions,
                 banned_strings=reasoning_banned if in_reasoning else content_banned,
@@ -2200,9 +2572,11 @@ class ExllamaV3Container:
                 return_top_tokens=params.top_logprobs,
                 return_probs=bool(params.logprobs) or bool(params.top_logprobs),
                 max_rq_tokens=max_rq_tokens,
-                stop_on_loop=params.get_stop_on_loop(),
+                stop_on_loop=bool(params.loop_detect),
                 filters=(
-                    [] if in_reasoning and not phases.engine_trigger else grammar_handler.filters
+                    []
+                    if in_reasoning and not (phases.engine_trigger or phases.gated)
+                    else grammar_handler.filters
                 ),
             )
         except AssertionError as ex:
@@ -2235,8 +2609,10 @@ class ExllamaV3Container:
         generated_tokens = 0
         full_response = ""
         metrics_result = {}
-        # Only the OAI request types carry the flag; Kobold requests don't
+        # Only the OAI request types carry these flags; Kobold requests don't
         return_progress = bool(getattr(params, "return_progress", False))
+        stop_after_output = bool(getattr(params, "stop_after_output", False))
+        stopped_at_output = False
         prefill_start_time: float | None = None
         prefill_cached_tokens = 0
 
@@ -2361,21 +2737,29 @@ class ExllamaV3Container:
 
                     yield finish_chunk
                     break
+
+                if chunk and stop_after_output:
+                    # Text is out and the job has no EOS of its own to reach;
+                    # the loop ends and the response finishes below
+                    stopped_at_output = True
+                    await job.cancel()
             else:
                 # The job ended without an EOS result. Cancelled from the status
-                # page: finish the response with what was generated. Otherwise
-                # the request itself was cancelled and nothing is sent
-                if job_status.cancel_requested:
-                    xlogger.warning(f"{label}: cancelled from the status page")
+                # page or stopped at its first output: finish the response with
+                # what was generated. Otherwise the request itself was cancelled
+                # and nothing is sent
+                if job_status.cancel_requested or stopped_at_output:
+                    if job_status.cancel_requested:
+                        xlogger.warning(f"{label}: cancelled from the status page")
                     finish_chunk = self.handle_finish_chunk(
                         {
-                            "eos_reason": "cancelled",
+                            "eos_reason": (
+                                "cancelled" if job_status.cancel_requested else "max_new_tokens"
+                            ),
                             "prompt_tokens": context_len,
                             "cached_tokens": prefill_cached_tokens,
-                            "time_prefill": 0.0,
                             "new_tokens": generated_tokens,
-                            "time_generate": 0.0,
-                            "time_enqueued": 0.0,
+                            **self._job_times(job),
                         },
                         request_id,
                         full_response,
@@ -2427,3 +2811,4 @@ class ExllamaV3Container:
                     context_len,
                     self.max_seq_len,
                 )
+                MetricsManager.record_finish(metrics_result)
