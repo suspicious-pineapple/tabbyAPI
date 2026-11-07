@@ -1115,7 +1115,7 @@ class ExllamaV3Container:
                 device="cuda:0",
                 max_pixels=0,
                 cache_bytes=2*(1<<30),
-                provided_model=self.vision_model
+                model=self.vision_model
                 )
             vdata = VisionData(encoder,self.tokenizer,mrope=False,placeholder_id=resolve_placeholder_id(self.config,self.tokenizer))
 
