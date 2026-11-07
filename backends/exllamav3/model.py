@@ -510,6 +510,15 @@ class ExllamaV3Container:
                 )
                 self.draft_model = Model.from_config(self.draft_config)
                 xlogger.info(f"Using draft model: {str(draft_model_path.resolve())}")
+
+                # Such a drafter loads inside the target's load, next to the
+                # layers it reads, so it has no split of its own
+                if self.draft_model.caps.get("load_with_target") and self.draft_gpu_split:
+                    xlogger.warning(
+                        "draft_gpu_split is ignored for this draft model, which loads "
+                        "alongside its target model."
+                    )
+                    self.draft_gpu_split = []
         else:
             self.draft_model = None
             self.draft_cache = None
@@ -1268,7 +1277,12 @@ class ExllamaV3Container:
                 if value:
                     yield value
 
-        if self.use_draft_model:
+        if self.draft_model is not None and self.draft_model.caps.get("load_with_target"):
+            xlogger.info(
+                f"Draft model {self.draft_model_dir} loads with its target model, "
+                "skipping its standalone load"
+            )
+        elif self.use_draft_model:
             for value in self.draft_model.load_gen(
                 reserve_per_device=(
                     None if (self.gpu_split or self.draft_gpu_split) else self.autosplit_reserve
@@ -1714,6 +1728,7 @@ class ExllamaV3Container:
         reasoning_phase: Optional[bool] = None,
         channel_parser=None,
         label: Optional[str] = None,
+        return_logits: bool = False,
     ) -> AsyncIterator[Dict[str, Any]]:
         """
         Generates a response iteratively (streaming) for a given prompt.
@@ -1734,6 +1749,9 @@ class ExllamaV3Container:
                 of headed messages that has yet to reach its content, where
                 grammar filters wait for the first content message.
             label: Short name for the request in console logs.
+            return_logits: Attach the raw logits of each generated position to
+                its chunk ("logits", shape (1, n, vocab)), for callers that read
+                the next-token distribution (the decision endpoints).
 
         Yields:
             Generation chunks
@@ -1764,6 +1782,7 @@ class ExllamaV3Container:
                 reasoning_phase=reasoning_phase,
                 channel_parser=channel_parser,
                 label=label,
+                return_logits=return_logits,
             ):
                 yield generation_chunk
         finally:
@@ -2397,6 +2416,7 @@ class ExllamaV3Container:
         reasoning_phase: Optional[bool] = None,
         channel_parser=None,
         label: Optional[str] = None,
+        return_logits: bool = False,
     ):
         """
         Create generator function for prompt completion.
@@ -2624,6 +2644,7 @@ class ExllamaV3Container:
                 embeddings=mm_embeddings_content,
                 return_top_tokens=params.top_logprobs,
                 return_probs=bool(params.logprobs) or bool(params.top_logprobs),
+                return_logits=return_logits,
                 max_rq_tokens=max_rq_tokens,
                 stop_on_loop=bool(params.loop_detect),
                 filters=(
@@ -2763,6 +2784,10 @@ class ExllamaV3Container:
                         "generated_tokens": generated_tokens,
                         "offset": len(full_response),
                     }
+
+                    # Raw logits for the generated positions, when requested
+                    if result.get("logits") is not None:
+                        generation["logits"] = result["logits"]
 
                     if params.logprobs > 0:
                         self.handle_logprobs(result, generation)
