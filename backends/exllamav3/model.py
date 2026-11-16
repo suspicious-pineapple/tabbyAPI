@@ -60,7 +60,6 @@ from common.metrics import MetricsManager
 from common.model_meta import read_model_meta
 from common.multimodal import MultimodalEmbeddingWrapper
 from common.networking import DisconnectHandler
-from common.optional_dependencies import check_package_version
 from common.sampling import BaseSamplerRequest
 from common.status_display import status_display
 from common.tabby_config import config
@@ -344,9 +343,6 @@ class ExllamaV3Container:
         )
 
         self = cls()
-
-        # Make sure ExllamaV3 is up to date
-        check_package_version("exllamav3", "1.6.6")
 
         self.model_dir = model_directory
         self.hf_model = hf_model
